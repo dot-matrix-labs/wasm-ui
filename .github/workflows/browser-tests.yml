@@ -1,0 +1,84 @@
+name: Browser Tests (headless Chromium)
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  browser-test:
+    name: Headless Chromium integration tests + screenshots
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── Checkout ─────────────────────────────────────────────────────────────
+      - uses: actions/checkout@v4
+
+      # ── Rust toolchain ───────────────────────────────────────────────────────
+      - name: Install Rust stable + wasm32 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-browser-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-browser-
+
+      # ── Install wasm-pack ─────────────────────────────────────────────────────
+      - name: Install wasm-pack
+        run: |
+          curl -sSL https://rustwasm.github.io/wasm-pack/installer/init.sh | sh
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          wasm-pack --version
+
+      # ── Build the WASM module ─────────────────────────────────────────────────
+      - name: Build WASM (release)
+        run: |
+          cd crates/ui-wasm
+          wasm-pack build --target web --release --out-dir ../../examples/web/pkg
+
+      # ── Install Chromium (headless) ───────────────────────────────────────────
+      #    Ubuntu runners ship with an up-to-date chromium package that supports
+      #    --headless=new and --remote-debugging-port out of the box.
+      - name: Install Chromium
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends chromium-browser
+          chromium-browser --version
+
+      # ── Run cdp-runner ───────────────────────────────────────────────────────
+      #    cdp-runner reads all its settings from env vars (CDP_URL, CDP_PORT,
+      #    CDP_HEADLESS, CDP_CHROME_BIN, CDP_SCREENSHOT_DIR).
+      #    It starts the python HTTP server and Chromium itself internally.
+      - name: Run cdp-runner (Chromium + CDP)
+        env:
+          CDP_URL: "http://127.0.0.1:8000/index.html"
+          CDP_PORT: "9222"
+          CDP_HEADLESS: "1"
+          CDP_CHROME_BIN: "chromium-browser"
+          CDP_NO_SERVER: "0"   # let cdp-runner start the python server
+          CDP_SCREENSHOT_DIR: "${{ github.workspace }}/screenshots"
+        run: |
+          mkdir -p screenshots
+          cargo test -p cdp-runner -- --nocapture 2>&1
+
+      # ── Upload screenshots as artifacts ──────────────────────────────────────
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-screenshots-${{ github.run_number }}
+          path: screenshots/
+          if-no-files-found: warn
+          retention-days: 30

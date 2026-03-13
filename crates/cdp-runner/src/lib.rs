@@ -14,6 +14,9 @@ pub struct Config {
     pub headless: bool,
     pub start_server: bool,
     pub start_chrome: bool,
+    /// Optional directory to write PNG screenshots into.
+    /// Populated from the `CDP_SCREENSHOT_DIR` env var.
+    pub screenshot_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for Config {
@@ -27,11 +30,92 @@ impl Default for Config {
             headless: env::var("CDP_HEADLESS").unwrap_or_else(|_| "1".to_string()) != "0",
             start_server: env::var("CDP_NO_SERVER").unwrap_or_else(|_| "0".to_string()) != "1",
             start_chrome: env::var("CDP_NO_CHROME").unwrap_or_else(|_| "0".to_string()) != "1",
+            screenshot_dir: env::var("CDP_SCREENSHOT_DIR").ok().map(std::path::PathBuf::from),
         }
     }
 }
 
+/// Capture a full-page PNG screenshot via CDP and write it to disk.
+/// If `screenshot_dir` is `None` the call is a no-op (returns `Ok(())`).
+fn take_screenshot(
+    cdp: &mut CdpClient,
+    screenshot_dir: &Option<std::path::PathBuf>,
+    name: &str,
+) -> Result<(), String> {
+    let dir = match screenshot_dir {
+        Some(d) => d,
+        None => return Ok(()),
+    };
+    // Ask Chromium for a PNG screenshot (base64 encoded).
+    let id = cdp.next_id;
+    cdp.next_id += 1;
+    let msg = format!(
+        "{{\"id\":{},\"method\":\"Page.captureScreenshot\",\"params\":{{\"format\":\"png\",\"fromSurface\":true}}}}",
+        id
+    );
+    cdp.ws.send_text(&msg)?;
+    let resp = cdp.wait_for_id(id, Duration::from_secs(10))?;
+    let b64 = resp
+        .pointer("/result/data")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "screenshot data missing".to_string())?;
+    let bytes = base64_decode(b64).map_err(|e| format!("screenshot decode: {}", e))?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("screenshot dir: {}", e))?;
+    let path = dir.join(format!("{}.png", name));
+    std::fs::write(&path, &bytes).map_err(|e| format!("screenshot write: {}", e))?;
+    println!("[screenshot] saved {}", path.display());
+    Ok(())
+}
+
+/// Minimal base64 decoder — no external dependencies.
+fn base64_decode(input: &str) -> Result<Vec<u8>, &'static str> {
+    const TABLE: &[u8; 128] = b"\x40\x40\x40\x40\x40\x40\x40\x40\x40\x40\x40\x40\x40\x40\x40\x40\
+                                 \x40\x40\x40\x40\x40\x40\x40\x40\x40\x40\x40\x40\x40\x40\x40\x40\
+                                 \x40\x40\x40\x40\x40\x40\x40\x40\x40\x40\x40\x3e\x40\x40\x40\x3f\
+                                 \x34\x35\x36\x37\x38\x39\x3a\x3b\x3c\x3d\x40\x40\x40\x40\x40\x40\
+                                 \x40\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\
+                                 \x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x40\x40\x40\x40\x40\
+                                 \x40\x1a\x1b\x1c\x1d\x1e\x1f\x20\x21\x22\x23\x24\x25\x26\x27\x28\
+                                 \x29\x2a\x2b\x2c\x2d\x2e\x2f\x30\x31\x32\x33\x40\x40\x40\x40\x40";
+    let input = input.trim();
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let bytes: Vec<u8> = input.bytes().filter(|b| *b != b'\n' && *b != b'\r').collect();
+    let mut i = 0;
+    while i + 3 < bytes.len() {
+        let a = bytes[i] as usize;
+        let b = bytes[i + 1] as usize;
+        let c = bytes[i + 2] as usize;
+        let d = bytes[i + 3] as usize;
+        if a >= 128 || b >= 128 || c >= 128 || d >= 128 {
+            return Err("invalid base64 char");
+        }
+        let va = TABLE[a];
+        let vb = TABLE[b];
+        let vc = TABLE[c];
+        let vd = TABLE[d];
+        if va == 0x40 || vb == 0x40 {
+            return Err("invalid base64 char");
+        }
+        out.push((va << 2) | (vb >> 4));
+        if bytes[i + 2] != b'=' {
+            if vc == 0x40 {
+                return Err("invalid base64 char");
+            }
+            out.push(((vb & 0x0f) << 4) | (vc >> 2));
+        }
+        if bytes[i + 3] != b'=' {
+            if vd == 0x40 {
+                return Err("invalid base64 char");
+            }
+            out.push(((vc & 0x03) << 6) | vd);
+        }
+        i += 4;
+    }
+    Ok(out)
+}
+
 pub fn run(config: Config) -> Result<(), String> {
+    let screenshot_dir = config.screenshot_dir.clone();
     let mut server = None;
     if config.start_server {
         server = Some(start_server()?);
@@ -68,10 +152,12 @@ pub fn run(config: Config) -> Result<(), String> {
         Duration::from_secs(3),
     )?;
     wait_for_a11y(&mut cdp, "GPU Forms UI", Duration::from_secs(3))?;
+    take_screenshot(&mut cdp, &screenshot_dir, "01_loaded")?;
 
     click_named(&mut cdp, "Dynamic Validation")?;
     thread::sleep(Duration::from_millis(200));
     wait_for_a11y(&mut cdp, "Username", Duration::from_secs(3))?;
+    take_screenshot(&mut cdp, &screenshot_dir, "02_dynamic_form")?;
 
     click_named(&mut cdp, "Username")?;
     cdp.eval_void("window.__app.handle_text_input('user1')")?;
@@ -79,14 +165,19 @@ pub fn run(config: Config) -> Result<(), String> {
     click_named(&mut cdp, "Age")?;
     cdp.eval_void("window.__app.handle_text_input('18')")?;
     tick_app(&mut cdp)?;
+    take_screenshot(&mut cdp, &screenshot_dir, "03_filled_form")?;
+
     click_named(&mut cdp, "Submit Profile")?;
     wait_for_a11y(&mut cdp, "Submitting...", Duration::from_secs(2))?;
+    take_screenshot(&mut cdp, &screenshot_dir, "04_submitting")?;
     thread::sleep(Duration::from_millis(1100));
     wait_for_a11y(&mut cdp, "Saved successfully.", Duration::from_secs(3))?;
+    take_screenshot(&mut cdp, &screenshot_dir, "05_success")?;
 
     click_named(&mut cdp, "Submit Profile")?;
     thread::sleep(Duration::from_millis(1100));
     wait_for_a11y(&mut cdp, "Server error, rolled back.", Duration::from_secs(3))?;
+    take_screenshot(&mut cdp, &screenshot_dir, "06_rollback")?;
 
     if let Some(mut child) = chrome {
         let _ = child.kill();
