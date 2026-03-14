@@ -80,6 +80,10 @@ pub struct Ui {
     pub scroll_offsets: std::collections::HashMap<u64, f32>,
     /// Whether the focused text input is in overwrite (insert-key toggle) mode.
     pub overwrite_mode: bool,
+    /// ID stack used to disambiguate widgets with identical labels.
+    /// Values are pushed/popped by the caller (e.g. loop index) and mixed
+    /// into every `hash_id` call so that repeated labels produce unique IDs.
+    id_stack: Vec<u64>,
 }
 
 impl Ui {
@@ -104,6 +108,7 @@ impl Ui {
             last_click_id: None,
             scroll_offsets: std::collections::HashMap::new(),
             overwrite_mode: false,
+            id_stack: Vec::new(),
         }
     }
 
@@ -945,8 +950,25 @@ impl Ui {
 
     fn hash_id(&self, label: &str) -> u64 {
         let mut hasher = DefaultHasher::new();
+        for &stack_val in &self.id_stack {
+            stack_val.hash(&mut hasher);
+        }
         label.hash(&mut hasher);
         hasher.finish()
+    }
+
+    /// Push a value onto the ID stack. All subsequent `hash_id` calls will
+    /// incorporate this value, making widget IDs unique even when labels repeat
+    /// (e.g. inside a loop). Must be paired with [`pop_id`].
+    pub fn push_id(&mut self, id: impl Hash) {
+        let mut hasher = DefaultHasher::new();
+        id.hash(&mut hasher);
+        self.id_stack.push(hasher.finish());
+    }
+
+    /// Pop the most recent value from the ID stack.
+    pub fn pop_id(&mut self) {
+        self.id_stack.pop();
     }
 
 }

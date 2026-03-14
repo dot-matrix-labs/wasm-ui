@@ -231,9 +231,10 @@ impl DemoApp {
             );
         }
         for (idx, (label, value)) in self.nested_contacts.iter_mut().enumerate() {
+            self.ui.push_id(idx);
             self.ui.label(&format!("Contact {}", idx + 1));
-            self.ui.text_input(&format!("Label {}", idx + 1), label, "Work");
-            self.ui.text_input(&format!("Email {}", idx + 1), value, "name@domain.com");
+            self.ui.text_input("Label", label, "Work");
+            self.ui.text_input("Email", value, "name@domain.com");
             let _ = self.nested_form.set_value(
                 &FormPath(vec!["contacts".into(), idx.to_string(), "label".into()]),
                 FieldValue::Text(label.text().to_string()),
@@ -242,6 +243,7 @@ impl DemoApp {
                 &FormPath(vec!["contacts".into(), idx.to_string(), "value".into()]),
                 FieldValue::Text(value.text().to_string()),
             );
+            self.ui.pop_id();
         }
         if self.ui.button("Submit Nested") {
             let mut form = self.nested_form.clone();
