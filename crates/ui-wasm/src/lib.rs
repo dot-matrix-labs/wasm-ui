@@ -38,7 +38,11 @@ impl WasmApp {
     }
 
     pub fn set_font_bytes(&mut self, bytes: Vec<u8>) {
-        self.renderer.set_font_bytes(bytes);
+        self.renderer.set_font_bytes(bytes.clone());
+        // Rebuild the TextMeasure with real per-glyph advance widths from fontdue.
+        // The closure captures a clone of the atlas handle and queries it on demand.
+        let measure = self.renderer.make_text_measure();
+        self.demo.set_measure(measure);
     }
 
     pub fn frame(&mut self, timestamp_ms: f64) -> Result<JsValue, JsValue> {

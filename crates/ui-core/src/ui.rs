@@ -6,6 +6,7 @@ use crate::batch::{Batch, Material, Quad, TextRun};
 use crate::hit_test::{HitTestEntry, HitTestGrid};
 use crate::input::{InputEvent, KeyCode, PointerButton};
 use crate::text::TextBuffer;
+use crate::text_measure::TextMeasure;
 use crate::theme::Theme;
 use crate::types::{Color, Rect, Vec2};
 use unicode_segmentation::UnicodeSegmentation;
@@ -70,20 +71,23 @@ pub struct Ui {
     pub clipboard_request: Option<String>,
     pub time_ms: f64,
     /// Number of rapid successive left-clicks on the same widget.
-    /// 1 = single, 2 = double (select word), 3+ = triple (select line).
     pub click_count: u8,
     /// Timestamp of the last pointer-down, used to detect double/triple clicks.
     pub last_click_time: f64,
-    /// Widget id that received the last click, used to reset count on target change.
+    /// Widget id that received the last click.
     pub last_click_id: Option<u64>,
-    /// Scroll offsets per widget id (horizontal pixel offset into the text).
+    /// Horizontal scroll offsets per widget id (pixels scrolled to the right).
     pub scroll_offsets: std::collections::HashMap<u64, f32>,
     /// Whether the focused text input is in overwrite (insert-key toggle) mode.
     pub overwrite_mode: bool,
+    /// Glyph advance-width provider.  Injected by the renderer layer so that
+    /// `ui-core` stays renderer-agnostic.  Defaults to a monospace fallback.
+    pub measure: TextMeasure,
 }
 
 impl Ui {
     pub fn new(width: f32, height: f32, theme: Theme) -> Self {
+        let font_size = 15.0; // default; overridden via set_measure()
         Self {
             theme,
             batch: Batch::default(),
@@ -104,7 +108,14 @@ impl Ui {
             last_click_id: None,
             scroll_offsets: std::collections::HashMap::new(),
             overwrite_mode: false,
+            measure: TextMeasure::monospace(font_size * 0.6),
         }
+    }
+
+    /// Replace the glyph-metrics provider.  Call this once after loading the
+    /// font (before the first frame that needs accurate hit-testing).
+    pub fn set_measure(&mut self, measure: TextMeasure) {
+        self.measure = measure;
     }
 
     pub fn begin_frame(
@@ -454,7 +465,7 @@ impl Ui {
     }
 
     pub fn text_input(&mut self, label: &str, buffer: &mut TextBuffer, placeholder: &str) -> bool {
-        self.text_input_impl(label, buffer, placeholder, false, 40.0 * self.scale)
+        self.text_input_impl(label, buffer, placeholder, false, false, None, 40.0 * self.scale)
     }
 
     pub fn text_input_multiline(
@@ -464,17 +475,46 @@ impl Ui {
         placeholder: &str,
         height: f32,
     ) -> bool {
-        self.text_input_impl(label, buffer, placeholder, true, height)
+        self.text_input_impl(label, buffer, placeholder, true, false, None, height)
     }
 
+    /// Password field — renders the value as bullet characters (`•`).
+    pub fn text_input_password(
+        &mut self,
+        label: &str,
+        buffer: &mut TextBuffer,
+        placeholder: &str,
+    ) -> bool {
+        self.text_input_impl(label, buffer, placeholder, false, true, None, 40.0 * self.scale)
+    }
+
+    /// Text input with an optional inline error message rendered below the field.
+    /// Pass `error: Some("message")` to show a red underline + error text.
+    pub fn text_input_with_error(
+        &mut self,
+        label: &str,
+        buffer: &mut TextBuffer,
+        placeholder: &str,
+        error: Option<&str>,
+    ) -> bool {
+        self.text_input_impl(label, buffer, placeholder, false, false, error, 40.0 * self.scale)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn text_input_impl(
         &mut self,
         label: &str,
         buffer: &mut TextBuffer,
         placeholder: &str,
         multiline: bool,
+        masked: bool,
+        error: Option<&str>,
         height: f32,
     ) -> bool {
+        let padding = 8.0;
+        let font_size = 15.0 * self.theme.font_scale * self.scale;
+        let line_height = font_size * 1.4;
+
         let rect = self.layout.next_rect(height);
         let id = self.hash_id(label);
         let clicked = self.rect_pressed(id, rect) && self.rect_released(id, rect);
@@ -483,10 +523,23 @@ impl Ui {
         }
         let focused = self.focused == Some(id);
         if focused {
-            self.apply_text_events(buffer, multiline);
-            self.apply_pointer_selection(id, rect, buffer);
+            // Check for Escape to blur before processing other events.
+            let escape_pressed = self.events.iter().any(|e| {
+                matches!(e, InputEvent::KeyDown { code: KeyCode::Escape, .. })
+            });
+            if escape_pressed {
+                buffer.set_caret(buffer.caret().index); // collapse selection
+                self.focused = None;
+            } else {
+                self.apply_text_events(buffer, multiline);
+                self.apply_pointer_selection(id, rect, buffer);
+                self.scroll_caret_into_view(id, rect, buffer, padding, font_size);
+            }
         }
 
+        let scroll_x = *self.scroll_offsets.get(&id).unwrap_or(&0.0);
+
+        // Background quad
         self.batch.push_quad(
             Quad {
                 rect,
@@ -497,33 +550,73 @@ impl Ui {
             Material::Solid,
             None,
         );
-        let content = if buffer.text().is_empty() {
+
+        // Focus ring (4 thin border quads)
+        if focused {
+            self.draw_focus_ring(rect);
+        }
+
+        // Error underline (thin red bottom border)
+        let has_error = error.is_some();
+        if has_error {
+            let border_h = 2.0;
+            let err_line = Rect::new(rect.x, rect.y + rect.h - border_h, rect.w, border_h);
+            self.batch.push_quad(
+                Quad {
+                    rect: err_line,
+                    uv: Rect::new(0.0, 0.0, 1.0, 1.0),
+                    color: self.theme.colors.error,
+                    flags: 0,
+                },
+                Material::Solid,
+                None,
+            );
+        }
+
+        // Display string (masked or real)
+        let is_empty = buffer.text().is_empty();
+        let display_text = if is_empty {
             placeholder.to_string()
+        } else if masked {
+            // Render bullet per grapheme, matching the real glyph count exactly.
+            use unicode_segmentation::UnicodeSegmentation;
+            let n = buffer.text().graphemes(true).count();
+            "•".repeat(n)
         } else {
             buffer.text().to_string()
         };
-        let color = if buffer.text().is_empty() {
+        let text_color = if is_empty {
             self.theme.colors.text_muted
         } else {
             self.theme.colors.text
         };
-        if focused {
-            self.draw_selection(rect, buffer, multiline);
+
+        if focused && !masked {
+            self.draw_selection(id, rect, buffer, multiline, scroll_x);
         }
 
+        // The TextRun is shifted left by scroll_x so long text scrolls.
+        let text_rect = Rect::new(
+            rect.x + padding - scroll_x,
+            rect.y,
+            rect.w - padding * 2.0 + scroll_x,
+            rect.h,
+        );
         self.batch.text_runs.push(TextRun {
-            rect: Rect::new(rect.x + 8.0, rect.y, rect.w - 16.0, rect.h),
-            text: content,
-            color,
-            font_size: 15.0 * self.theme.font_scale * self.scale,
+            rect: text_rect,
+            text: display_text,
+            color: text_color,
+            font_size,
             clip: Some(rect),
         });
 
+        // Blinking caret
         if focused {
             let show_caret = (self.time_ms as u64 / 500) % 2 == 0;
             if show_caret {
-                let caret_pos = self.index_to_position(rect, buffer, buffer.caret().index, multiline);
-                let caret_rect = Rect::new(caret_pos.x, caret_pos.y, 1.5, 18.0 * self.scale);
+                // For masked inputs use bullet width as advance; for real text use measure.
+                let caret_pos = self.index_to_position(id, rect, buffer, buffer.caret().index, multiline, scroll_x, masked);
+                let caret_rect = Rect::new(caret_pos.x, caret_pos.y, 1.5, line_height);
                 self.batch.push_quad(
                     Quad {
                         rect: caret_rect,
@@ -537,6 +630,18 @@ impl Ui {
             }
         }
 
+        // Optional inline error message
+        if let Some(err_msg) = error {
+            let err_rect = self.layout.next_rect(18.0 * self.scale);
+            self.batch.text_runs.push(TextRun {
+                rect: err_rect,
+                text: err_msg.to_string(),
+                color: self.theme.colors.error,
+                font_size: 12.0 * self.theme.font_scale * self.scale,
+                clip: None,
+            });
+        }
+
         self.widgets.push(WidgetInfo {
             id,
             kind: WidgetKind::TextInput,
@@ -544,9 +649,9 @@ impl Ui {
             value: Some(buffer.text().to_string()),
             rect,
             state: A11yState {
-                focused,
+                focused: self.focused == Some(id),
                 disabled: false,
-                invalid: false,
+                invalid: has_error,
                 required: false,
                 expanded: false,
                 selected: false,
@@ -749,7 +854,10 @@ impl Ui {
             match event {
                 InputEvent::PointerDown(ev) => {
                     if rect.contains(ev.pos) && ev.button == Some(PointerButton::Left) {
-                        let idx = self.position_to_index(rect, buffer, ev.pos);
+                        let scroll_x = *self.scroll_offsets.get(&id).unwrap_or(&0.0);
+                        // Adjust the pointer X for the scroll offset before hit-testing.
+                        let adjusted_pos = Vec2::new(ev.pos.x + scroll_x, ev.pos.y);
+                        let idx = self.position_to_index(id, rect, buffer, adjusted_pos);
 
                         // --- Multi-click detection ---
                         let same_target = self.last_click_id == Some(id);
@@ -786,11 +894,22 @@ impl Ui {
                 }
                 InputEvent::PointerMove(ev) => {
                     if self.dragging == Some(id) {
-                        let idx = self.position_to_index(rect, buffer, ev.pos);
+                        let scroll_x = *self.scroll_offsets.get(&id).unwrap_or(&0.0);
+                        let adjusted_pos = Vec2::new(ev.pos.x + scroll_x, ev.pos.y);
+                        let idx = self.position_to_index(id, rect, buffer, adjusted_pos);
                         let start = self.selection_anchor.unwrap_or(buffer.caret().index);
                         buffer.set_selection(start, idx);
-                        // TODO: if ev.pos is outside rect horizontally, nudge
-                        // self.scroll_offsets[id] to auto-scroll the viewport.
+                        // Drag autoscroll: nudge scroll_x if pointer is outside rect.
+                        let overshoot_right = ev.pos.x - (rect.x + rect.w);
+                        let overshoot_left  = rect.x - ev.pos.x;
+                        let nudge = 8.0_f32; // px per frame
+                        if overshoot_right > 0.0 {
+                            let new_sx = scroll_x + nudge;
+                            self.scroll_offsets.insert(id, new_sx);
+                        } else if overshoot_left > 0.0 {
+                            let new_sx = (scroll_x - nudge).max(0.0);
+                            self.scroll_offsets.insert(id, new_sx);
+                        }
                     }
                 }
                 InputEvent::PointerUp(ev) => {
@@ -804,70 +923,160 @@ impl Ui {
         }
     }
 
-    fn position_to_index(&self, rect: Rect, buffer: &TextBuffer, pos: Vec2) -> usize {
+    /// Adjust `scroll_offsets[id]` so the caret remains inside the visible
+    /// horizontal window of `rect`.
+    fn scroll_caret_into_view(
+        &mut self,
+        id: u64,
+        rect: Rect,
+        buffer: &TextBuffer,
+        padding: f32,
+        font_size: f32,
+    ) {
+        let scroll_x = *self.scroll_offsets.get(&id).unwrap_or(&0.0);
+        // Use real advance widths up to the caret position on its line.
+        let caret_idx = buffer.caret().index;
+        // Find the line the caret is on and how far along it we are.
+        let mut remaining = caret_idx;
+        let mut caret_line_text = "";
+        let mut caret_col = 0usize;
+        for line in buffer.text().split('\n') {
+            let graphemes = line.graphemes(true).count();
+            if remaining <= graphemes {
+                caret_line_text = line;
+                caret_col = remaining;
+                break;
+            }
+            remaining = remaining.saturating_sub(graphemes + 1);
+        }
+        // Sum advances up to caret_col on that line.
+        let caret_x_in_text: f32 = caret_line_text
+            .graphemes(true)
+            .take(caret_col)
+            .flat_map(|g| g.chars())
+            .map(|ch| self.measure.advance(ch))
+            .sum();
+        let _ = font_size; // reserved for future line-height calcs
+
+        let visible_left  = scroll_x;
+        let visible_right = scroll_x + rect.w - padding * 2.0;
+        let new_scroll = if caret_x_in_text < visible_left {
+            (caret_x_in_text - padding).max(0.0)
+        } else if caret_x_in_text > visible_right {
+            caret_x_in_text - (rect.w - padding * 3.0)
+        } else {
+            scroll_x
+        };
+        self.scroll_offsets.insert(id, new_scroll.max(0.0));
+    }
+
+    /// Draw four thin quads forming a focus ring just inside `rect`.
+    fn draw_focus_ring(&mut self, rect: Rect) {
+        let t = 2.0_f32; // border thickness in logical pixels
+        let color = self.theme.colors.focus_ring;
+        let borders = [
+            Rect::new(rect.x,             rect.y,             rect.w, t),     // top
+            Rect::new(rect.x,             rect.y + rect.h - t, rect.w, t),   // bottom
+            Rect::new(rect.x,             rect.y,             t, rect.h),     // left
+            Rect::new(rect.x + rect.w - t, rect.y,           t, rect.h),     // right
+        ];
+        for border in borders {
+            self.batch.push_quad(
+                Quad { rect: border, uv: Rect::new(0.0, 0.0, 1.0, 1.0), color, flags: 0 },
+                Material::Solid,
+                None,
+            );
+        }
+    }
+
+    fn position_to_index(&self, _id: u64, rect: Rect, buffer: &TextBuffer, pos: Vec2) -> usize {
         let padding = 8.0;
         let font_size = 15.0 * self.theme.font_scale * self.scale;
         let line_height = font_size * 1.4;
-        let x = (pos.x - rect.x - padding).max(0.0);
+        let scroll_x = 0.0_f32; // TODO: pass id scroll offset when needed for click accuracy
+        let x = (pos.x - rect.x - padding + scroll_x).max(0.0);
         let y = (pos.y - rect.y - padding).max(0.0);
-        let line = (y / line_height).floor() as usize;
-        let char_width = font_size * 0.6;
-        let col = (x / char_width).floor() as usize;
+        let target_line = (y / line_height).floor() as usize;
         let mut index = 0usize;
         for (line_idx, line_text) in buffer.text().split('\n').enumerate() {
-            let graphemes = line_text.graphemes(true).count();
-            if line_idx == line {
-                index += col.min(graphemes);
+            if line_idx == target_line {
+                // Use real glyph advances for this line.
+                index += self.measure.x_to_grapheme_index(line_text, x);
                 return index;
             }
-            index += graphemes + 1;
+            index += line_text.graphemes(true).count() + 1; // +1 for \n
         }
         buffer.grapheme_len()
     }
 
-    fn index_to_position(&self, rect: Rect, buffer: &TextBuffer, index: usize, _multiline: bool) -> Vec2 {
+    fn index_to_position(
+        &self,
+        _id: u64,
+        rect: Rect,
+        buffer: &TextBuffer,
+        index: usize,
+        _multiline: bool,
+        scroll_x: f32,
+        masked: bool,
+    ) -> Vec2 {
         let padding = 8.0;
         let font_size = 15.0 * self.theme.font_scale * self.scale;
         let line_height = font_size * 1.4;
-        let char_width = font_size * 0.6;
         let mut remaining = index;
         let mut line = 0;
         for line_text in buffer.text().split('\n') {
-            let graphemes = line_text.graphemes(true).count();
-            if remaining <= graphemes {
-                let x = rect.x + padding + remaining as f32 * char_width;
+            let graphemes: Vec<&str> = line_text.graphemes(true).collect();
+            let count = graphemes.len();
+            if remaining <= count {
+                // Sum advance widths up to `remaining` graphemes on this line.
+                let x_in_text: f32 = if masked {
+                    // For password fields, use the bullet glyph width.
+                    self.measure.advance('•') * remaining as f32
+                } else {
+                    graphemes[..remaining]
+                        .iter()
+                        .flat_map(|g| g.chars())
+                        .map(|ch| self.measure.advance(ch))
+                        .sum()
+                };
+                let x = rect.x + padding + x_in_text - scroll_x;
                 let y = rect.y + padding + line as f32 * line_height;
                 return Vec2::new(x, y);
             }
-            remaining = remaining.saturating_sub(graphemes + 1);
+            remaining = remaining.saturating_sub(count + 1);
             line += 1;
         }
         Vec2::new(rect.x + padding, rect.y + padding)
     }
 
-    fn draw_selection(&mut self, rect: Rect, buffer: &TextBuffer, _multiline: bool) {
+    fn draw_selection(
+        &mut self,
+        _id: u64,
+        rect: Rect,
+        buffer: &TextBuffer,
+        _multiline: bool,
+        scroll_x: f32,
+    ) {
         let selection = match buffer.selection() {
             Some(sel) if !sel.is_empty() => sel.normalized(),
             _ => return,
         };
         let font_size = 15.0 * self.theme.font_scale * self.scale;
         let line_height = font_size * 1.4;
-        let char_width = font_size * 0.6;
         let padding = 8.0;
         let lines: Vec<&str> = buffer.text().split('\n').collect();
         let (start_line, start_col) = self.index_to_line_col(&lines, selection.start);
-        let (end_line, end_col) = self.index_to_line_col(&lines, selection.end);
+        let (end_line, end_col)     = self.index_to_line_col(&lines, selection.end);
 
-        for line in start_line..=end_line {
-            let line_len = lines
-                .get(line)
-                .map(|text| text.graphemes(true).count())
-                .unwrap_or(0);
-            let (col_start, col_end) = if line == start_line && line == end_line {
+        for line_idx in start_line..=end_line {
+            let line_text = lines.get(line_idx).copied().unwrap_or("");
+            let graphemes: Vec<&str> = line_text.graphemes(true).collect();
+            let line_len = graphemes.len();
+            let (col_start, col_end) = if line_idx == start_line && line_idx == end_line {
                 (start_col, end_col)
-            } else if line == start_line {
+            } else if line_idx == start_line {
                 (start_col, line_len)
-            } else if line == end_line {
+            } else if line_idx == end_line {
                 (0, end_col)
             } else {
                 (0, line_len)
@@ -875,9 +1084,14 @@ impl Ui {
             if col_start == col_end {
                 continue;
             }
-            let x = rect.x + padding + col_start as f32 * char_width;
-            let y = rect.y + padding + line as f32 * line_height;
-            let w = (col_end as f32 - col_start as f32) * char_width;
+            // Use real advances for selection rect width.
+            let x_start: f32 = graphemes[..col_start]
+                .iter().flat_map(|g| g.chars()).map(|c| self.measure.advance(c)).sum();
+            let x_end:   f32 = graphemes[..col_end]
+                .iter().flat_map(|g| g.chars()).map(|c| self.measure.advance(c)).sum();
+            let x = rect.x + padding + x_start - scroll_x;
+            let y = rect.y + padding + line_idx as f32 * line_height;
+            let w = x_end - x_start;
             let sel_rect = Rect::new(x, y, w, line_height);
             self.batch.push_quad(
                 Quad {

@@ -5,6 +5,7 @@ use ui_core::batch::{Batch, TextRun};
 use ui_core::form::{FieldSchema, FieldType, FieldValue, Form, FormEvent, FormPath, FormSchema};
 use ui_core::input::{InputEvent, KeyCode, Modifiers, PointerButton, PointerEvent, TextInputEvent};
 use ui_core::text::TextBuffer;
+use ui_core::text_measure::TextMeasure;
 use ui_core::theme::Theme;
 use ui_core::ui::Ui;
 use ui_core::validation::ValidationRule;
@@ -94,6 +95,12 @@ impl DemoApp {
             register_confirm: TextBuffer::new(""),
             register_role: "User".to_string(),
         }
+    }
+
+    /// Forward a new glyph-metrics provider to the inner `Ui`.\n    /// Call this after `set_font_bytes` so that hit-testing and scroll
+    /// calculations use real advance widths.
+    pub fn set_measure(&mut self, measure: TextMeasure) {
+        self.ui.set_measure(measure);
     }
 
     pub fn frame(&mut self, width: f32, height: f32, scale: f32, timestamp_ms: f64) -> FrameOutput {

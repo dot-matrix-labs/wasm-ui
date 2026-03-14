@@ -3,6 +3,7 @@ use web_sys::{HtmlCanvasElement, WebGl2RenderingContext as Gl, WebGlBuffer, WebG
 
 use ui_core::batch::{Batch, Material, Quad, TextRun};
 use ui_core::types::Rect;
+use ui_core::TextMeasure;
 
 use crate::atlas::TextAtlas;
 
@@ -55,6 +56,31 @@ impl Renderer {
 
     pub fn set_font_bytes(&mut self, bytes: Vec<u8>) {
         self.atlas.set_font_bytes(bytes);
+    }
+
+    /// Build a `TextMeasure` from the current font.  Pre-warms the full printable
+    /// ASCII range at the UI font size and caches advance widths into a `HashMap`
+    /// so that the closure is Send + Sync without any RefCell.
+    pub fn make_text_measure(&mut self) -> TextMeasure {
+        let font_size = 15.0_f32; // must match the font_size used in text_input_impl
+        let mut cache: std::collections::HashMap<char, f32> =
+            std::collections::HashMap::with_capacity(128);
+        // Pre-warm printable ASCII
+        for cp in 0x20u32..=0x7eu32 {
+            if let Some(ch) = char::from_u32(cp) {
+                let glyph = self.atlas.ensure_glyph(ch, font_size);
+                cache.insert(ch, glyph.advance);
+            }
+        }
+        // Common Unicode ranges: Latin-1 Supplement, bullet, em-dash, ellipsis
+        let extras: &[char] = &['\u{00B7}', '\u{2022}', '\u{2014}', '\u{2026}', '\u{00E9}',
+                                 '\u{00E0}', '\u{00FC}', '\u{00F6}', '\u{00E4}'];
+        for &ch in extras {
+            let glyph = self.atlas.ensure_glyph(ch, font_size);
+            cache.insert(ch, glyph.advance);
+        }
+        let fallback = font_size * 0.6;
+        TextMeasure::new(move |ch: char| *cache.get(&ch).unwrap_or(&fallback))
     }
 
     pub fn render(&mut self, batch: &Batch, text_runs: &[TextRun]) -> Result<(), JsValue> {

@@ -6,6 +6,7 @@ pub mod input;
 pub mod rest;
 pub mod state;
 pub mod text;
+pub mod text_measure;
 pub mod theme;
 pub mod types;
 pub mod ui;
@@ -17,5 +18,6 @@ pub use form::{FieldId, FieldValue, Form, FormEvent, FormPath, FormSchema};
 pub use input::{InputEvent, KeyCode, Modifiers, PointerButton, PointerEvent, TextInputEvent};
 pub use state::History;
 pub use text::{Caret, Selection, TextBuffer, TextEditOp};
+pub use text_measure::TextMeasure;
 pub use types::{Color, Rect, Vec2};
 

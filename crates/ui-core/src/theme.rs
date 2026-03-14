@@ -16,6 +16,8 @@ pub struct ThemeColors {
     pub primary: Color,
     pub error: Color,
     pub success: Color,
+    /// Color of the focus ring drawn around the active text input.
+    pub focus_ring: Color,
 }
 
 impl Theme {
@@ -31,6 +33,7 @@ impl Theme {
                 primary: Color::rgba(0.2, 0.45, 0.9, 1.0),
                 error: Color::rgba(0.88, 0.2, 0.2, 1.0),
                 success: Color::rgba(0.2, 0.7, 0.3, 1.0),
+                focus_ring: Color::rgba(0.2, 0.45, 0.9, 0.8),
             },
         }
     }
