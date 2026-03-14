@@ -24,7 +24,7 @@ pub struct DrawCmd {
     pub clip: Option<Rect>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Material {
     Solid,
     TextAtlas,

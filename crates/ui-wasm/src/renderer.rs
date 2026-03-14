@@ -1,16 +1,40 @@
 use wasm_bindgen::{JsCast, JsValue};
-use web_sys::{HtmlCanvasElement, WebGl2RenderingContext as Gl, WebGlBuffer, WebGlProgram, WebGlShader, WebGlTexture};
+use web_sys::{
+    HtmlCanvasElement, WebGl2RenderingContext as Gl, WebGlBuffer, WebGlProgram, WebGlShader,
+    WebGlTexture, WebGlUniformLocation, WebGlVertexArrayObject,
+};
 
 use ui_core::batch::{Batch, Material, Quad, TextRun};
 use ui_core::types::Rect;
 
 use crate::atlas::TextAtlas;
 
+/// Cached uniform locations for a shader program.
+struct ProgramUniforms {
+    program: WebGlProgram,
+    u_resolution: Option<WebGlUniformLocation>,
+    u_atlas: Option<WebGlUniformLocation>,
+}
+
+impl ProgramUniforms {
+    fn new(gl: &Gl, program: WebGlProgram) -> Self {
+        let u_resolution = gl.get_uniform_location(&program, "u_resolution");
+        let u_atlas = gl.get_uniform_location(&program, "u_atlas");
+        Self {
+            program,
+            u_resolution,
+            u_atlas,
+        }
+    }
+}
+
 pub struct Renderer {
     gl: Gl,
-    program: WebGlProgram,
+    solid_program: ProgramUniforms,
+    text_program: ProgramUniforms,
     vbo: WebGlBuffer,
     ibo: WebGlBuffer,
+    vao: WebGlVertexArrayObject,
     atlas: TextAtlas,
     atlas_texture: WebGlTexture,
     width: f32,
@@ -23,20 +47,60 @@ impl Renderer {
             .get_context("webgl2")?
             .ok_or_else(|| JsValue::from_str("WebGL2 not supported"))?
             .dyn_into()?;
-        let program = link_program(&gl, VERT_SHADER, FRAG_SHADER)?;
-        let vbo = gl.create_buffer().ok_or_else(|| JsValue::from_str("no vbo"))?;
-        let ibo = gl.create_buffer().ok_or_else(|| JsValue::from_str("no ibo"))?;
-        let atlas_texture = gl.create_texture().ok_or_else(|| JsValue::from_str("no texture"))?;
 
-        gl.use_program(Some(&program));
+        let solid_prog = link_program(&gl, SOLID_VERT_SHADER, SOLID_FRAG_SHADER)?;
+        let text_prog = link_program(&gl, TEXT_VERT_SHADER, TEXT_FRAG_SHADER)?;
+
+        let vbo = gl
+            .create_buffer()
+            .ok_or_else(|| JsValue::from_str("no vbo"))?;
+        let ibo = gl
+            .create_buffer()
+            .ok_or_else(|| JsValue::from_str("no ibo"))?;
+        let vao = gl
+            .create_vertex_array()
+            .ok_or_else(|| JsValue::from_str("no vao"))?;
+        let atlas_texture = gl
+            .create_texture()
+            .ok_or_else(|| JsValue::from_str("no texture"))?;
+
+        // Set up the VAO with vertex attrib pointers once.
+        // Both programs share the same vertex layout, so we use solid_prog for
+        // attribute locations (they are identical across programs thanks to
+        // the same `layout(location = N)` qualifiers).
+        gl.bind_vertex_array(Some(&vao));
+        gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&vbo));
+        gl.bind_buffer(Gl::ELEMENT_ARRAY_BUFFER, Some(&ibo));
+
+        let stride = 9 * 4; // 9 floats * 4 bytes
+        // location 0 = a_pos (vec2)
+        gl.enable_vertex_attrib_array(0);
+        gl.vertex_attrib_pointer_with_i32(0, 2, Gl::FLOAT, false, stride, 0);
+        // location 1 = a_uv (vec2)
+        gl.enable_vertex_attrib_array(1);
+        gl.vertex_attrib_pointer_with_i32(1, 2, Gl::FLOAT, false, stride, 2 * 4);
+        // location 2 = a_color (vec4)
+        gl.enable_vertex_attrib_array(2);
+        gl.vertex_attrib_pointer_with_i32(2, 4, Gl::FLOAT, false, stride, 4 * 4);
+        // location 3 = a_flags (float)
+        gl.enable_vertex_attrib_array(3);
+        gl.vertex_attrib_pointer_with_i32(3, 1, Gl::FLOAT, false, stride, 8 * 4);
+
+        gl.bind_vertex_array(None);
+
         gl.enable(Gl::BLEND);
         gl.blend_func(Gl::SRC_ALPHA, Gl::ONE_MINUS_SRC_ALPHA);
 
+        let solid_program = ProgramUniforms::new(&gl, solid_prog);
+        let text_program = ProgramUniforms::new(&gl, text_prog);
+
         let mut renderer = Self {
             gl,
-            program,
+            solid_program,
+            text_program,
             vbo,
             ibo,
+            vao,
             atlas: TextAtlas::new(1024, 1024),
             atlas_texture,
             width,
@@ -147,13 +211,8 @@ impl Renderer {
 
     fn draw_batch(&mut self, batch: &Batch) -> Result<(), JsValue> {
         let gl = &self.gl;
-        gl.use_program(Some(&self.program));
 
-        let u_resolution = gl.get_uniform_location(&self.program, "u_resolution");
-        if let Some(loc) = u_resolution {
-            gl.uniform2f(Some(&loc), self.width, self.height);
-        }
-
+        // Upload vertex + index data into the VBO/IBO (VAO remembers the bindings).
         let mut vertex_data: Vec<f32> = Vec::with_capacity(batch.vertices.len() * 9);
         for v in &batch.vertices {
             vertex_data.push(v.pos.x);
@@ -168,6 +227,8 @@ impl Renderer {
         }
         let index_data = batch.indices.clone();
 
+        gl.bind_vertex_array(Some(&self.vao));
+
         gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&self.vbo));
         unsafe {
             let vert_array = js_sys::Float32Array::view(&vertex_data);
@@ -176,35 +237,41 @@ impl Renderer {
         gl.bind_buffer(Gl::ELEMENT_ARRAY_BUFFER, Some(&self.ibo));
         unsafe {
             let idx_array = js_sys::Uint32Array::view(&index_data);
-            gl.buffer_data_with_array_buffer_view(Gl::ELEMENT_ARRAY_BUFFER, &idx_array, Gl::DYNAMIC_DRAW);
+            gl.buffer_data_with_array_buffer_view(
+                Gl::ELEMENT_ARRAY_BUFFER,
+                &idx_array,
+                Gl::DYNAMIC_DRAW,
+            );
         }
-
-        let stride = 9 * 4;
-        let a_pos = gl.get_attrib_location(&self.program, "a_pos") as u32;
-        let a_uv = gl.get_attrib_location(&self.program, "a_uv") as u32;
-        let a_color = gl.get_attrib_location(&self.program, "a_color") as u32;
-        let a_flags = gl.get_attrib_location(&self.program, "a_flags") as u32;
-
-        gl.enable_vertex_attrib_array(a_pos);
-        gl.vertex_attrib_pointer_with_i32(a_pos, 2, Gl::FLOAT, false, stride, 0);
-
-        gl.enable_vertex_attrib_array(a_uv);
-        gl.vertex_attrib_pointer_with_i32(a_uv, 2, Gl::FLOAT, false, stride, 2 * 4);
-
-        gl.enable_vertex_attrib_array(a_color);
-        gl.vertex_attrib_pointer_with_i32(a_color, 4, Gl::FLOAT, false, stride, 4 * 4);
-
-        gl.enable_vertex_attrib_array(a_flags);
-        gl.vertex_attrib_pointer_with_i32(a_flags, 1, Gl::FLOAT, false, stride, 8 * 4);
 
         gl.clear_color(0.97, 0.97, 0.96, 1.0);
         gl.clear(Gl::COLOR_BUFFER_BIT);
 
+        let mut current_material: Option<Material> = None;
+
         for cmd in &batch.commands {
-            match cmd.material {
-                Material::TextAtlas => self.bind_text_texture(),
-                Material::Solid => self.unbind_text_texture(),
-                Material::IconAtlas => self.bind_text_texture(),
+            // Switch program when material changes.
+            if current_material != Some(cmd.material) {
+                current_material = Some(cmd.material);
+                match cmd.material {
+                    Material::Solid => {
+                        gl.use_program(Some(&self.solid_program.program));
+                        if let Some(ref loc) = self.solid_program.u_resolution {
+                            gl.uniform2f(Some(loc), self.width, self.height);
+                        }
+                    }
+                    Material::TextAtlas | Material::IconAtlas => {
+                        gl.use_program(Some(&self.text_program.program));
+                        if let Some(ref loc) = self.text_program.u_resolution {
+                            gl.uniform2f(Some(loc), self.width, self.height);
+                        }
+                        gl.active_texture(Gl::TEXTURE0);
+                        gl.bind_texture(Gl::TEXTURE_2D, Some(&self.atlas_texture));
+                        if let Some(ref loc) = self.text_program.u_atlas {
+                            gl.uniform1i(Some(loc), 0);
+                        }
+                    }
+                }
             }
 
             if let Some(clip) = cmd.clip {
@@ -227,27 +294,9 @@ impl Renderer {
             );
         }
 
+        gl.bind_vertex_array(None);
+
         Ok(())
-    }
-
-    fn bind_text_texture(&self) {
-        let gl = &self.gl;
-        gl.active_texture(Gl::TEXTURE0);
-        gl.bind_texture(Gl::TEXTURE_2D, Some(&self.atlas_texture));
-        if let Some(loc) = gl.get_uniform_location(&self.program, "u_use_texture") {
-            gl.uniform1i(Some(&loc), 1);
-        }
-        if let Some(loc) = gl.get_uniform_location(&self.program, "u_atlas") {
-            gl.uniform1i(Some(&loc), 0);
-        }
-    }
-
-    fn unbind_text_texture(&self) {
-        let gl = &self.gl;
-        gl.bind_texture(Gl::TEXTURE_2D, None);
-        if let Some(loc) = gl.get_uniform_location(&self.program, "u_use_texture") {
-            gl.uniform1i(Some(&loc), 0);
-        }
     }
 }
 
@@ -292,15 +341,19 @@ fn link_program(gl: &Gl, vert_src: &str, frag_src: &str) -> Result<WebGlProgram,
     }
 }
 
-const VERT_SHADER: &str = r#"
-attribute vec2 a_pos;
-attribute vec2 a_uv;
-attribute vec4 a_color;
-attribute float a_flags;
+// ---------------------------------------------------------------------------
+// Solid-color shaders (no texture sampling)
+// ---------------------------------------------------------------------------
+
+const SOLID_VERT_SHADER: &str = r#"#version 300 es
+layout(location = 0) in vec2 a_pos;
+layout(location = 1) in vec2 a_uv;
+layout(location = 2) in vec4 a_color;
+layout(location = 3) in float a_flags;
 uniform vec2 u_resolution;
-varying vec2 v_uv;
-varying vec4 v_color;
-varying float v_flags;
+out vec2 v_uv;
+out vec4 v_color;
+out float v_flags;
 void main() {
   vec2 zeroToOne = a_pos / u_resolution;
   vec2 zeroToTwo = zeroToOne * 2.0;
@@ -312,18 +365,47 @@ void main() {
 }
 "#;
 
-const FRAG_SHADER: &str = r#"
+const SOLID_FRAG_SHADER: &str = r#"#version 300 es
 precision mediump float;
-varying vec2 v_uv;
-varying vec4 v_color;
-uniform sampler2D u_atlas;
-uniform int u_use_texture;
+in vec4 v_color;
+out vec4 fragColor;
 void main() {
-  if (u_use_texture == 1) {
-    float a = texture2D(u_atlas, v_uv).r;
-    gl_FragColor = vec4(v_color.rgb, v_color.a * a);
-  } else {
-    gl_FragColor = v_color;
-  }
+  fragColor = v_color;
+}
+"#;
+
+// ---------------------------------------------------------------------------
+// Textured (atlas) shaders — used for TextAtlas and IconAtlas materials
+// ---------------------------------------------------------------------------
+
+const TEXT_VERT_SHADER: &str = r#"#version 300 es
+layout(location = 0) in vec2 a_pos;
+layout(location = 1) in vec2 a_uv;
+layout(location = 2) in vec4 a_color;
+layout(location = 3) in float a_flags;
+uniform vec2 u_resolution;
+out vec2 v_uv;
+out vec4 v_color;
+out float v_flags;
+void main() {
+  vec2 zeroToOne = a_pos / u_resolution;
+  vec2 zeroToTwo = zeroToOne * 2.0;
+  vec2 clipSpace = zeroToTwo - 1.0;
+  gl_Position = vec4(clipSpace.x, -clipSpace.y, 0.0, 1.0);
+  v_uv = a_uv;
+  v_color = a_color;
+  v_flags = a_flags;
+}
+"#;
+
+const TEXT_FRAG_SHADER: &str = r#"#version 300 es
+precision mediump float;
+in vec2 v_uv;
+in vec4 v_color;
+uniform sampler2D u_atlas;
+out vec4 fragColor;
+void main() {
+  float a = texture(u_atlas, v_uv).r;
+  fragColor = vec4(v_color.rgb, v_color.a * a);
 }
 "#;
