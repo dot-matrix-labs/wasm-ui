@@ -1,5 +1,6 @@
 mod atlas;
 mod demo;
+mod http;
 mod renderer;
 
 use demo::DemoApp;
@@ -20,6 +21,7 @@ pub struct WasmApp {
 impl WasmApp {
     #[wasm_bindgen(constructor)]
     pub fn new(canvas: HtmlCanvasElement, width: f32, height: f32, scale: f32) -> Result<WasmApp, JsValue> {
+        console_error_panic_hook::set_once();
         let renderer = Renderer::new(&canvas, width, height)?;
         Ok(Self {
             demo: DemoApp::new(width, height),
@@ -39,6 +41,13 @@ impl WasmApp {
 
     pub fn set_font_bytes(&mut self, bytes: Vec<u8>) {
         self.renderer.set_font_bytes(bytes);
+    }
+
+    /// Load a fallback font from raw bytes.  Missing glyphs in the primary font
+    /// are looked up in fallbacks in the order they were added.
+    /// Task 2.6: Font Fallback Chain.
+    pub fn add_fallback_font_bytes(&mut self, bytes: Vec<u8>) {
+        self.renderer.add_fallback_font_bytes(bytes);
     }
 
     pub fn frame(&mut self, timestamp_ms: f64) -> Result<JsValue, JsValue> {
@@ -63,11 +72,11 @@ impl WasmApp {
         self.demo.handle_wheel(x, y, dx, dy, ctrl, alt, shift, meta);
     }
 
-    pub fn handle_key_down(&mut self, code: u32, ctrl: bool, alt: bool, shift: bool, meta: bool) {
+    pub fn handle_key_down(&mut self, code: String, ctrl: bool, alt: bool, shift: bool, meta: bool) {
         self.demo.handle_key_down(code, ctrl, alt, shift, meta);
     }
 
-    pub fn handle_key_up(&mut self, code: u32, ctrl: bool, alt: bool, shift: bool, meta: bool) {
+    pub fn handle_key_up(&mut self, code: String, ctrl: bool, alt: bool, shift: bool, meta: bool) {
         self.demo.handle_key_up(code, ctrl, alt, shift, meta);
     }
 
@@ -93,6 +102,26 @@ impl WasmApp {
 
     pub fn take_clipboard_request(&mut self) -> Option<String> {
         self.demo.take_clipboard_request()
+    }
+
+    /// Task 3.5: Pass prefers-reduced-motion from JS.
+    pub fn set_reduce_motion(&mut self, reduce: bool) {
+        self.demo.set_reduce_motion(reduce);
+    }
+
+    /// Task 3.6: Pass CSS env() safe area insets from JS.
+    pub fn set_safe_area_insets(&mut self, top: f32, right: f32, bottom: f32, left: f32) {
+        self.demo.set_safe_area_insets(top, right, bottom, left);
+    }
+
+    /// Task 6.5: Switch between light and dark theme.
+    pub fn set_dark_mode(&mut self, dark: bool) {
+        self.demo.set_dark_mode(dark);
+    }
+
+    /// Task 6.1: Handle autofill values from password manager.
+    pub fn handle_autofill(&mut self, field: String, value: String) {
+        self.demo.handle_autofill(field, value);
     }
 }
 

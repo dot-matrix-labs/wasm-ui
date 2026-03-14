@@ -23,7 +23,7 @@ pub struct PointerEvent {
     pub modifiers: Modifiers,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KeyCode {
     Backspace,
     Delete,
@@ -45,7 +45,7 @@ pub enum KeyCode {
     X,
     Z,
     Y,
-    Other(u32),
+    Other(String),
 }
 
 #[derive(Clone, Debug)]

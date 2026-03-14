@@ -1,54 +1,30 @@
-use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::collections::HashMap;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum HttpMethod {
-    Get,
-    Post,
-    Put,
-    Patch,
-    Delete,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Request {
-    pub id: u64,
-    pub method: HttpMethod,
     pub url: String,
-    pub body: Option<serde_json::Value>,
-    pub timeout_ms: u64,
+    pub method: String,
+    pub headers: HashMap<String, String>,
+    pub body: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Response {
     pub status: u16,
-    pub body: serde_json::Value,
+    pub body: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone)]
 pub struct RetryPolicy {
-    pub max_retries: u8,
+    pub max_retries: u32,
     pub base_delay_ms: u64,
-    pub max_delay_ms: u64,
 }
 
-impl RetryPolicy {
-    pub fn default_fast() -> Self {
+impl Default for RetryPolicy {
+    fn default() -> Self {
         Self {
-            max_retries: 2,
-            base_delay_ms: 250,
-            max_delay_ms: 1500,
+            max_retries: 3,
+            base_delay_ms: 500,
         }
     }
-
-    pub fn delay_for_attempt(&self, attempt: u8) -> Duration {
-        let factor = 2u64.saturating_pow(attempt as u32);
-        let delay = self.base_delay_ms.saturating_mul(factor).min(self.max_delay_ms);
-        Duration::from_millis(delay)
-    }
 }
-
-pub trait HttpClient {
-    fn request(&mut self, request: Request) -> Result<Response, String>;
-}
-

@@ -1,7 +1,6 @@
-use im::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
 
 use crate::state::History;
 use crate::validation::{validate_value, ValidationError, ValidationRule};
@@ -118,7 +117,7 @@ impl FormState {
 #[derive(Clone, Debug)]
 pub struct PendingSubmission {
     pub id: u64,
-    pub snapshot: Arc<FormState>,
+    pub snapshot: FormState,
     pub payload: serde_json::Value,
     pub retries_left: u8,
 }
@@ -136,7 +135,7 @@ pub enum FormEvent {
 #[derive(Clone, Debug)]
 pub struct Form {
     pub schema: FormSchema,
-    pub state: Arc<FormState>,
+    pub state: FormState,
     pub history: History<FormState>,
     pub pending: Option<PendingSubmission>,
     pub last_error: Option<String>,
@@ -148,7 +147,7 @@ impl Form {
         let state = Self::build_initial_state(&schema);
         Self {
             history: History::new(state.clone()),
-            state: Arc::new(state),
+            state,
             schema,
             pending: None,
             last_error: None,
@@ -235,7 +234,7 @@ impl Form {
     }
 
     pub fn set_value(&mut self, path: &FormPath, value: FieldValue) -> FormEvent {
-        let mut next = (*self.state).clone();
+        let mut next = self.state.clone();
         if let Some(field) = next.fields.get_mut(path) {
             field.value = value;
             field.touched = true;
@@ -244,7 +243,7 @@ impl Form {
         }
         Self::update_parent_groups(&mut next, path);
         self.history.push(next.clone());
-        self.state = Arc::new(next);
+        self.state = next;
         FormEvent::FieldChanged(path.clone())
     }
 
@@ -281,7 +280,7 @@ impl Form {
     }
 
     pub fn add_repeat_group(&mut self, path: &FormPath, fields: Vec<FieldSchema>) -> bool {
-        let mut next = (*self.state).clone();
+        let mut next = self.state.clone();
         let mut additions: Vec<(FormPath, FieldState)> = Vec::new();
         let mut added = false;
         if let Some(field) = next.fields.get_mut(path) {
@@ -326,7 +325,7 @@ impl Form {
             next.fields.insert(child_path, state);
         }
         self.history.push(next.clone());
-        self.state = Arc::new(next);
+        self.state = next;
         true
     }
 
@@ -338,13 +337,13 @@ impl Form {
         if errors.is_empty() {
             Ok(())
         } else {
-            let mut next = (*self.state).clone();
+            let mut next = self.state.clone();
             for err in &errors {
                 if let Some(field) = next.fields.get_mut(&err.path) {
                     field.errors.push(err.message.clone());
                 }
             }
-            self.state = Arc::new(next);
+            self.state = next;
             Err(errors)
         }
     }
@@ -404,50 +403,45 @@ impl Form {
             payload,
             retries_left: retries,
         });
-        if let Some(pending) = &self.pending {
-            let mut next = (*self.state).clone();
-            for (_path, field) in next.fields.iter_mut() {
-                field.pending = true;
-            }
-            self.state = Arc::new(next);
-            return Ok(FormEvent::SubmissionStarted(pending.id));
+        let mut next = self.state.clone();
+        for (_path, field) in next.fields.iter_mut() {
+            field.pending = true;
         }
-        Err(FormEvent::SubmissionError(id, "failed to start".to_string()))
+        self.state = next;
+        Ok(FormEvent::SubmissionStarted(id))
     }
 
     pub fn apply_success(&mut self, id: u64) -> FormEvent {
-        if let Some(pending) = &self.pending {
-            if pending.id == id {
-                let mut next = (*self.state).clone();
-                for (_path, field) in next.fields.iter_mut() {
-                    field.pending = false;
-                    field.dirty = false;
-                }
-                self.state = Arc::new(next);
-                self.pending = None;
-                return FormEvent::SubmissionSuccess(id);
+        let matches = self.pending.as_ref().map_or(false, |p| p.id == id);
+        if matches {
+            let mut next = self.state.clone();
+            for (_path, field) in next.fields.iter_mut() {
+                field.pending = false;
+                field.dirty = false;
             }
+            self.state = next;
+            self.pending = None;
+            return FormEvent::SubmissionSuccess(id);
         }
         FormEvent::SubmissionError(id, "unknown submission".to_string())
     }
 
     pub fn apply_error(&mut self, id: u64, message: &str, rollback: bool) -> FormEvent {
-        if let Some(pending) = &self.pending {
-            if pending.id == id {
-                self.last_error = Some(message.to_string());
-                if rollback {
-                    self.state = pending.snapshot.clone();
-                    self.pending = None;
-                    return FormEvent::RolledBack(id);
-                }
-                let mut next = (*self.state).clone();
-                for (_path, field) in next.fields.iter_mut() {
-                    field.pending = false;
-                }
-                self.state = Arc::new(next);
-                self.pending = None;
-                return FormEvent::SubmissionError(id, message.to_string());
+        let matches = self.pending.as_ref().map_or(false, |p| p.id == id);
+        if matches {
+            self.last_error = Some(message.to_string());
+            if rollback {
+                let snapshot = self.pending.take().unwrap().snapshot;
+                self.state = snapshot;
+                return FormEvent::RolledBack(id);
             }
+            let mut next = self.state.clone();
+            for (_path, field) in next.fields.iter_mut() {
+                field.pending = false;
+            }
+            self.state = next;
+            self.pending = None;
+            return FormEvent::SubmissionError(id, message.to_string());
         }
         FormEvent::SubmissionError(id, "unknown submission".to_string())
     }
@@ -463,17 +457,15 @@ impl Form {
     }
 
     pub fn timeout_pending(&mut self) -> FormEvent {
-        if let Some(pending) = &self.pending {
-            return self.apply_error(pending.id, "timeout", true);
+        if let Some(id) = self.pending.as_ref().map(|p| p.id) {
+            return self.apply_error(id, "timeout", true);
         }
         FormEvent::SubmissionError(0, "no pending submission".to_string())
     }
 
     pub fn set_field_error(&mut self, path: &FormPath, message: &str) {
-        let mut next = (*self.state).clone();
-        if let Some(field) = next.fields.get_mut(path) {
+        if let Some(field) = self.state.fields.get_mut(path) {
             field.errors.push(message.to_string());
         }
-        self.state = Arc::new(next);
     }
 }

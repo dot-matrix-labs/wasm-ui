@@ -5,6 +5,7 @@ use crate::accessibility::{A11yNode, A11yRole, A11yState, A11yTree};
 use crate::batch::{Batch, Material, Quad, TextRun};
 use crate::hit_test::{HitTestEntry, HitTestGrid};
 use crate::input::{InputEvent, KeyCode, PointerButton};
+use crate::metrics::{GlyphMetrics, MonospaceMetrics};
 use crate::text::TextBuffer;
 use crate::theme::Theme;
 use crate::types::{Color, Rect, Vec2};
@@ -36,6 +37,9 @@ pub struct Layout {
     cursor: Vec2,
     width: f32,
     spacing: f32,
+    /// When Some, we are inside a begin_row/end_row block.
+    /// Stores (row_start_x, row_start_y, max_height_seen_so_far, gap).
+    row_state: Option<(f32, f32, f32, f32)>,
 }
 
 impl Layout {
@@ -44,13 +48,42 @@ impl Layout {
             cursor: Vec2::new(x, y),
             width,
             spacing: 10.0,
+            row_state: None,
         }
     }
 
     pub fn next_rect(&mut self, height: f32) -> Rect {
-        let rect = Rect::new(self.cursor.x, self.cursor.y, self.width, height);
-        self.cursor.y += height + self.spacing;
-        rect
+        if let Some((_, _, ref mut max_h, gap)) = self.row_state {
+            // Horizontal layout: place item at current cursor, advance X.
+            let rect = Rect::new(self.cursor.x, self.cursor.y, self.width, height);
+            // Width will be overridden by caller in row context; here just provide
+            // a single-item wide rect and let begin/end_row manage widths.
+            if height > *max_h {
+                *max_h = height;
+            }
+            self.cursor.x += self.width + gap;
+            rect
+        } else {
+            let rect = Rect::new(self.cursor.x, self.cursor.y, self.width, height);
+            self.cursor.y += height + self.spacing;
+            rect
+        }
+    }
+
+    /// Reserve a rect of explicit width (used inside row containers).
+    pub fn next_rect_sized(&mut self, width: f32, height: f32) -> Rect {
+        if let Some((_, _, ref mut max_h, gap)) = self.row_state {
+            let rect = Rect::new(self.cursor.x, self.cursor.y, width, height);
+            if height > *max_h {
+                *max_h = height;
+            }
+            self.cursor.x += width + gap;
+            rect
+        } else {
+            let rect = Rect::new(self.cursor.x, self.cursor.y, width, height);
+            self.cursor.y += height + self.spacing;
+            rect
+        }
     }
 }
 
@@ -80,6 +113,18 @@ pub struct Ui {
     pub scroll_offsets: std::collections::HashMap<u64, f32>,
     /// Whether the focused text input is in overwrite (insert-key toggle) mode.
     pub overwrite_mode: bool,
+    /// Task 3.5: When true, skip animated focus indicators (prefers-reduced-motion).
+    pub reduce_motion: bool,
+    /// Task 3.6: Safe area insets (top, right, bottom, left) in logical pixels.
+    pub safe_area_insets: (f32, f32, f32, f32),
+    /// Task 3.3: The widget id of the currently open dropdown (if any).
+    pub open_dropdown: Option<u64>,
+    /// Task 3.3: Selected index inside the open dropdown.
+    pub dropdown_selected: usize,
+    /// Task 3.2: Scroll offsets per scroll-container id (vertical pixel offset).
+    pub container_scroll: std::collections::HashMap<u64, f32>,
+    /// Task 2.3: Proportional Text Metrics — pluggable glyph advance provider.
+    pub glyph_metrics: Box<dyn GlyphMetrics + Send + Sync>,
 }
 
 impl Ui {
@@ -104,7 +149,26 @@ impl Ui {
             last_click_id: None,
             scroll_offsets: std::collections::HashMap::new(),
             overwrite_mode: false,
+            reduce_motion: false,
+            safe_area_insets: (0.0, 0.0, 0.0, 0.0),
+            open_dropdown: None,
+            dropdown_selected: 0,
+            container_scroll: std::collections::HashMap::new(),
+            glyph_metrics: Box::new(MonospaceMetrics),
         }
+    }
+
+    /// Task 3.5: Called by the host to indicate prefers-reduced-motion.
+    pub fn set_reduce_motion(&mut self, reduce: bool) {
+        self.reduce_motion = reduce;
+    }
+
+    /// Task 3.6: Set safe area insets received from the host (CSS env() values).
+    pub fn set_safe_area_insets(&mut self, top: f32, right: f32, bottom: f32, left: f32) {
+        self.safe_area_insets = (top, right, bottom, left);
+        let (t, _r, _b, l) = self.safe_area_insets;
+        // Recompute the layout origin to respect insets.
+        self.layout = Layout::new(24.0 + l, 24.0 + t, self.layout.width);
     }
 
     pub fn begin_frame(
@@ -193,6 +257,7 @@ impl Ui {
         self.focused = Some(self.widgets[idx].id);
     }
 
+    /// Render a non-interactive text label.
     pub fn label(&mut self, text: &str) {
         let rect = self.layout.next_rect(24.0 * self.scale);
         self.widgets.push(WidgetInfo {
@@ -223,12 +288,15 @@ impl Ui {
         });
     }
 
+    /// Render a clickable button. Returns `true` on the frame it is clicked.
     pub fn button(&mut self, label: &str) -> bool {
         let rect = self.layout.next_rect(40.0 * self.scale);
         let id = self.hash_id(label);
-        let hovered = self.rect_hovered(id, rect);
-        let pressed = self.rect_pressed(id, rect);
-        let clicked = pressed && self.rect_released(id, rect);
+        // Task 3.4: expand touch target on mobile
+        let touch_rect = self.expand_touch_target(rect);
+        let hovered = self.rect_hovered(id, touch_rect);
+        let pressed = self.rect_pressed(id, touch_rect);
+        let clicked = pressed && self.rect_released(id, touch_rect);
 
         self.widgets.push(WidgetInfo {
             id,
@@ -280,13 +348,18 @@ impl Ui {
         if clicked {
             self.focused = Some(id);
         }
+        // Task 3.5: focus ring
+        self.draw_focus_ring_if_focused(id, rect);
         clicked
     }
 
+    /// Render a checkbox toggle. Returns `true` when the value changes.
     pub fn checkbox(&mut self, label: &str, value: &mut bool) -> bool {
         let rect = self.layout.next_rect(32.0 * self.scale);
         let id = self.hash_id(label);
-        let clicked = self.rect_pressed(id, rect) && self.rect_released(id, rect);
+        // Task 3.4: expand touch target
+        let touch_rect = self.expand_touch_target(rect);
+        let clicked = self.rect_pressed(id, touch_rect) && self.rect_released(id, touch_rect);
         if clicked {
             *value = !*value;
             self.focused = Some(id);
@@ -338,13 +411,17 @@ impl Ui {
             },
         });
 
+        // Task 3.5: focus ring
+        self.draw_focus_ring_if_focused(id, rect);
         clicked
     }
 
     pub fn select(&mut self, label: &str, options: &[String], value: &mut String) -> bool {
         let rect = self.layout.next_rect(36.0 * self.scale);
         let id = self.hash_id(label);
-        let clicked = self.rect_pressed(id, rect) && self.rect_released(id, rect);
+        // Task 3.4: expand touch target
+        let touch_rect = self.expand_touch_target(rect);
+        let clicked = self.rect_pressed(id, touch_rect) && self.rect_released(id, touch_rect);
         if clicked {
             if let Some(pos) = options.iter().position(|v| v == value) {
                 let next = (pos + 1) % options.len();
@@ -387,6 +464,8 @@ impl Ui {
             },
         });
 
+        // Task 3.5: focus ring
+        self.draw_focus_ring_if_focused(id, rect);
         clicked
     }
 
@@ -453,8 +532,14 @@ impl Ui {
         changed
     }
 
+    /// Render a single-line text input. Returns `true` when the buffer changes.
     pub fn text_input(&mut self, label: &str, buffer: &mut TextBuffer, placeholder: &str) -> bool {
-        self.text_input_impl(label, buffer, placeholder, false, 40.0 * self.scale)
+        self.text_input_impl(label, buffer, placeholder, false, false, 40.0 * self.scale)
+    }
+
+    /// Render a password input with masked characters. Returns `true` when the buffer changes.
+    pub fn password_input(&mut self, label: &str, buffer: &mut TextBuffer, placeholder: &str) -> bool {
+        self.text_input_impl(label, buffer, placeholder, false, true, 40.0 * self.scale)
     }
 
     pub fn text_input_multiline(
@@ -464,7 +549,7 @@ impl Ui {
         placeholder: &str,
         height: f32,
     ) -> bool {
-        self.text_input_impl(label, buffer, placeholder, true, height)
+        self.text_input_impl(label, buffer, placeholder, true, false, height)
     }
 
     fn text_input_impl(
@@ -473,11 +558,14 @@ impl Ui {
         buffer: &mut TextBuffer,
         placeholder: &str,
         multiline: bool,
+        masked: bool,
         height: f32,
     ) -> bool {
         let rect = self.layout.next_rect(height);
         let id = self.hash_id(label);
-        let clicked = self.rect_pressed(id, rect) && self.rect_released(id, rect);
+        // Task 3.4: expand touch target for hit testing
+        let touch_rect = self.expand_touch_target(rect);
+        let clicked = self.rect_pressed(id, touch_rect) && self.rect_released(id, touch_rect);
         if clicked {
             self.focused = Some(id);
         }
@@ -499,6 +587,8 @@ impl Ui {
         );
         let content = if buffer.text().is_empty() {
             placeholder.to_string()
+        } else if masked {
+            "\u{2022}".repeat(buffer.grapheme_len())
         } else {
             buffer.text().to_string()
         };
@@ -553,6 +643,8 @@ impl Ui {
             },
         });
 
+        // Task 3.5: focus ring
+        self.draw_focus_ring_if_focused(id, rect);
         clicked
     }
 
@@ -805,36 +897,41 @@ impl Ui {
     }
 
     fn position_to_index(&self, rect: Rect, buffer: &TextBuffer, pos: Vec2) -> usize {
+        // Task 2.3: Proportional Text Metrics — use actual glyph advances.
         let padding = 8.0;
         let font_size = 15.0 * self.theme.font_scale * self.scale;
         let line_height = font_size * 1.4;
         let x = (pos.x - rect.x - padding).max(0.0);
         let y = (pos.y - rect.y - padding).max(0.0);
         let line = (y / line_height).floor() as usize;
-        let char_width = font_size * 0.6;
-        let col = (x / char_width).floor() as usize;
         let mut index = 0usize;
         for (line_idx, line_text) in buffer.text().split('\n').enumerate() {
-            let graphemes = line_text.graphemes(true).count();
+            let graphemes_count = line_text.graphemes(true).count();
             if line_idx == line {
-                index += col.min(graphemes);
+                // Build prefix sums for this line and binary-search for x.
+                let prefix = self.glyph_metrics.advance_prefix_sums(line_text, font_size);
+                let col = self.glyph_metrics.index_for_x(&prefix, x);
+                index += col.min(graphemes_count);
                 return index;
             }
-            index += graphemes + 1;
+            index += graphemes_count + 1;
         }
         buffer.grapheme_len()
     }
 
     fn index_to_position(&self, rect: Rect, buffer: &TextBuffer, index: usize, _multiline: bool) -> Vec2 {
+        // Task 2.3: Proportional Text Metrics — use advance prefix sums.
         let padding = 8.0;
         let font_size = 15.0 * self.theme.font_scale * self.scale;
         let line_height = font_size * 1.4;
-        let char_width = font_size * 0.6;
         let mut remaining = index;
         for (line, line_text) in buffer.text().split('\n').enumerate() {
             let graphemes = line_text.graphemes(true).count();
             if remaining <= graphemes {
-                let x = rect.x + padding + remaining as f32 * char_width;
+                // prefix[remaining] gives the pixel x-offset for this grapheme.
+                let prefix = self.glyph_metrics.advance_prefix_sums(line_text, font_size);
+                let x_off = prefix.get(remaining).copied().unwrap_or(0.0);
+                let x = rect.x + padding + x_off;
                 let y = rect.y + padding + line as f32 * line_height;
                 return Vec2::new(x, y);
             }
@@ -844,23 +941,22 @@ impl Ui {
     }
 
     fn draw_selection(&mut self, rect: Rect, buffer: &TextBuffer, _multiline: bool) {
+        // Task 2.3: Proportional Text Metrics — use per-line advance prefix sums.
         let selection = match buffer.selection() {
             Some(sel) if !sel.is_empty() => sel.normalized(),
             _ => return,
         };
         let font_size = 15.0 * self.theme.font_scale * self.scale;
         let line_height = font_size * 1.4;
-        let char_width = font_size * 0.6;
         let padding = 8.0;
         let lines: Vec<&str> = buffer.text().split('\n').collect();
         let (start_line, start_col) = self.index_to_line_col(&lines, selection.start);
         let (end_line, end_col) = self.index_to_line_col(&lines, selection.end);
 
         for line in start_line..=end_line {
-            let line_len = lines
-                .get(line)
-                .map(|text| text.graphemes(true).count())
-                .unwrap_or(0);
+            let line_text = lines.get(line).copied().unwrap_or("");
+            let line_len = line_text.graphemes(true).count();
+            let prefix = self.glyph_metrics.advance_prefix_sums(line_text, font_size);
             let (col_start, col_end) = if line == start_line && line == end_line {
                 (start_col, end_col)
             } else if line == start_line {
@@ -873,9 +969,11 @@ impl Ui {
             if col_start == col_end {
                 continue;
             }
-            let x = rect.x + padding + col_start as f32 * char_width;
+            let x_start = prefix.get(col_start).copied().unwrap_or(0.0);
+            let x_end = prefix.get(col_end).copied().unwrap_or(0.0);
+            let x = rect.x + padding + x_start;
             let y = rect.y + padding + line as f32 * line_height;
-            let w = (col_end as f32 - col_start as f32) * char_width;
+            let w = (x_end - x_start).max(1.0);
             let sel_rect = Rect::new(x, y, w, line_height);
             self.batch.push_quad(
                 Quad {
@@ -947,6 +1045,254 @@ impl Ui {
         let mut hasher = DefaultHasher::new();
         label.hash(&mut hasher);
         hasher.finish()
+    }
+
+    /// Task 3.5: Draw a 2-pixel focus ring outline around `rect` when the
+    /// widget with `id` is focused.
+    fn draw_focus_ring_if_focused(&mut self, id: u64, rect: Rect) {
+        if self.focused != Some(id) {
+            return;
+        }
+        let color = self.theme.colors.focus_ring;
+        let w = 2.0;
+        // Top bar
+        self.batch.push_quad(Quad { rect: Rect::new(rect.x - w, rect.y - w, rect.w + w * 2.0, w), uv: Rect::new(0.0,0.0,1.0,1.0), color, flags: 0 }, Material::Solid, None);
+        // Bottom bar
+        self.batch.push_quad(Quad { rect: Rect::new(rect.x - w, rect.y + rect.h, rect.w + w * 2.0, w), uv: Rect::new(0.0,0.0,1.0,1.0), color, flags: 0 }, Material::Solid, None);
+        // Left bar
+        self.batch.push_quad(Quad { rect: Rect::new(rect.x - w, rect.y - w, w, rect.h + w * 2.0), uv: Rect::new(0.0,0.0,1.0,1.0), color, flags: 0 }, Material::Solid, None);
+        // Right bar
+        self.batch.push_quad(Quad { rect: Rect::new(rect.x + rect.w, rect.y - w, w, rect.h + w * 2.0), uv: Rect::new(0.0,0.0,1.0,1.0), color, flags: 0 }, Material::Solid, None);
+    }
+
+    /// Task 3.4: Expand `rect` to a minimum 44pt touch target for hit-testing
+    /// on high-DPI / mobile (scale > 1.5). Returns the expanded rect.
+    fn expand_touch_target(&self, rect: Rect) -> Rect {
+        if self.scale <= 1.5 {
+            return rect;
+        }
+        let min_size = 44.0 * self.scale;
+        let extra_w = (min_size - rect.w).max(0.0);
+        let extra_h = (min_size - rect.h).max(0.0);
+        Rect::new(
+            rect.x - extra_w * 0.5,
+            rect.y - extra_h * 0.5,
+            rect.w + extra_w,
+            rect.h + extra_h,
+        )
+    }
+
+    // -------------------------------------------------------------------------
+    // Task 3.1: Horizontal row containers
+    // -------------------------------------------------------------------------
+
+    /// Begin a horizontal row layout. Children will be placed side-by-side.
+    /// `gap` is the pixel spacing between children.
+    pub fn begin_row(&mut self, gap: f32) {
+        self.layout.row_state = Some((
+            self.layout.cursor.x,
+            self.layout.cursor.y,
+            0.0,
+            gap,
+        ));
+    }
+
+    /// End the current horizontal row layout and advance the vertical cursor
+    /// past the tallest child.
+    pub fn end_row(&mut self) {
+        if let Some((start_x, start_y, max_h, _)) = self.layout.row_state.take() {
+            self.layout.cursor.x = start_x;
+            self.layout.cursor.y = start_y + max_h + self.layout.spacing;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Task 3.2: Scroll containers (stub — scissor rect support TODO in renderer)
+    // -------------------------------------------------------------------------
+
+    /// Begin a scroll container of the given visual `height`.
+    /// Returns the visible rect. Scrolling is tracked per `id`.
+    pub fn begin_scroll(&mut self, id: u64, height: f32) -> Rect {
+        let rect = self.layout.next_rect(height);
+        // Draw background for the scroll area
+        self.batch.push_quad(
+            Quad { rect, uv: Rect::new(0.0, 0.0, 1.0, 1.0), color: self.theme.colors.surface, flags: 0 },
+            Material::Solid,
+            None,
+        );
+        // Handle wheel events inside this rect
+        for event in &self.events.clone() {
+            if let crate::input::InputEvent::PointerWheel { pos, delta, .. } = event {
+                if rect.contains(*pos) {
+                    let offset = self.container_scroll.entry(id).or_insert(0.0);
+                    *offset = (*offset + delta.y).max(0.0);
+                }
+            }
+        }
+        rect
+    }
+
+    /// End the scroll container. `clip_rect` is the rect returned by begin_scroll.
+    pub fn end_scroll(&mut self, _clip_rect: Rect) {
+        // TODO: pop scissor rect from renderer when scissor support is added.
+    }
+
+    // -------------------------------------------------------------------------
+    // Task 3.3: Proper dropdown / select widget
+    // -------------------------------------------------------------------------
+
+    /// Draw a dropdown (select) widget. Returns true when the value changes.
+    pub fn dropdown(&mut self, label: &str, options: &[String], value: &mut String) -> bool {
+        let rect = self.layout.next_rect(36.0 * self.scale);
+        let id = self.hash_id(label);
+        let touch_rect = self.expand_touch_target(rect);
+        let clicked = self.rect_pressed(id, touch_rect) && self.rect_released(id, touch_rect);
+        let is_open = self.open_dropdown == Some(id);
+
+        if clicked {
+            if is_open {
+                self.open_dropdown = None;
+            } else {
+                self.open_dropdown = Some(id);
+                // Set selected index to current value
+                self.dropdown_selected = options.iter().position(|v| v == value).unwrap_or(0);
+            }
+            self.focused = Some(id);
+        }
+
+        // Handle keyboard when open
+        if is_open && self.focused == Some(id) {
+            for event in &self.events.clone() {
+                match event {
+                    crate::input::InputEvent::KeyDown { code, .. } => match code {
+                        KeyCode::ArrowDown => {
+                            if self.dropdown_selected + 1 < options.len() {
+                                self.dropdown_selected += 1;
+                            }
+                        }
+                        KeyCode::ArrowUp => {
+                            if self.dropdown_selected > 0 {
+                                self.dropdown_selected -= 1;
+                            }
+                        }
+                        KeyCode::Enter => {
+                            *value = options[self.dropdown_selected].clone();
+                            self.open_dropdown = None;
+                        }
+                        KeyCode::Escape => {
+                            self.open_dropdown = None;
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+        }
+
+        // Handle click outside to close
+        if is_open {
+            for event in &self.events.clone() {
+                if let crate::input::InputEvent::PointerDown(ev) = event {
+                    if ev.button == Some(crate::input::PointerButton::Left) && !rect.contains(ev.pos) {
+                        // Check if the click is inside the floating list
+                        let list_h = options.len() as f32 * 32.0 * self.scale;
+                        let list_rect = Rect::new(rect.x, rect.y + rect.h, rect.w, list_h);
+                        if !list_rect.contains(ev.pos) {
+                            self.open_dropdown = None;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Draw button face
+        self.batch.push_quad(
+            Quad { rect, uv: Rect::new(0.0,0.0,1.0,1.0), color: self.theme.colors.surface, flags: 0 },
+            Material::Solid,
+            None,
+        );
+        let text = format!("{}: {} ▾", label, value);
+        self.batch.text_runs.push(TextRun {
+            rect: Rect::new(rect.x + 8.0, rect.y, rect.w - 16.0, rect.h),
+            text,
+            color: self.theme.colors.text,
+            font_size: 15.0 * self.theme.font_scale * self.scale,
+            clip: None,
+        });
+
+        self.draw_focus_ring_if_focused(id, rect);
+
+        let mut changed = false;
+
+        // Draw floating option list when open
+        if self.open_dropdown == Some(id) {
+            let item_h = 32.0 * self.scale;
+            let list_h = options.len() as f32 * item_h;
+            let list_rect = Rect::new(rect.x, rect.y + rect.h, rect.w, list_h);
+
+            // Background
+            self.batch.push_quad(
+                Quad { rect: list_rect, uv: Rect::new(0.0,0.0,1.0,1.0), color: self.theme.colors.surface, flags: 0 },
+                Material::Solid,
+                None,
+            );
+
+            for (i, option) in options.iter().enumerate() {
+                let item_rect = Rect::new(list_rect.x, list_rect.y + i as f32 * item_h, list_rect.w, item_h);
+                let item_id = self.hash_id(&format!("{}-opt-{}", label, i));
+                let item_hovered = self.rect_hovered(item_id, item_rect);
+
+                if item_hovered {
+                    self.batch.push_quad(
+                        Quad { rect: item_rect, uv: Rect::new(0.0,0.0,1.0,1.0), color: Color::rgba(self.theme.colors.primary.r, self.theme.colors.primary.g, self.theme.colors.primary.b, 0.15), flags: 0 },
+                        Material::Solid,
+                        None,
+                    );
+                }
+                if i == self.dropdown_selected {
+                    self.batch.push_quad(
+                        Quad { rect: Rect::new(item_rect.x, item_rect.y, 3.0, item_rect.h), uv: Rect::new(0.0,0.0,1.0,1.0), color: self.theme.colors.primary, flags: 0 },
+                        Material::Solid,
+                        None,
+                    );
+                }
+
+                // Check click on item
+                let item_pressed = self.rect_pressed(item_id, item_rect);
+                let item_released = self.rect_released(item_id, item_rect);
+                if item_pressed && item_released {
+                    *value = option.clone();
+                    self.open_dropdown = None;
+                    changed = true;
+                }
+
+                self.batch.text_runs.push(TextRun {
+                    rect: Rect::new(item_rect.x + 12.0, item_rect.y, item_rect.w - 16.0, item_rect.h),
+                    text: option.clone(),
+                    color: self.theme.colors.text,
+                    font_size: 15.0 * self.theme.font_scale * self.scale,
+                    clip: Some(list_rect),
+                });
+            }
+        }
+
+        self.widgets.push(WidgetInfo {
+            id,
+            kind: WidgetKind::Select,
+            label: label.to_string(),
+            value: Some(value.clone()),
+            rect,
+            state: A11yState {
+                focused: self.focused == Some(id),
+                disabled: false,
+                invalid: false,
+                required: false,
+                expanded: self.open_dropdown == Some(id),
+                selected: true,
+            },
+        });
+
+        changed
     }
 
 }

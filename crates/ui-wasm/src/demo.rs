@@ -41,6 +41,8 @@ pub struct FrameOutput {
 pub struct DemoApp {
     ui: Ui,
     events: Vec<InputEvent>,
+    /// Reusable drain buffer for events to avoid per-frame allocation (Task 4.7).
+    events_scratch: Vec<InputEvent>,
     mode: DemoMode,
     login_email: TextBuffer,
     login_password: TextBuffer,
@@ -71,6 +73,7 @@ impl DemoApp {
         Self {
             ui: Ui::new(width, height, theme),
             events: Vec::new(),
+            events_scratch: Vec::new(),
             mode: DemoMode::Login,
             login_email: TextBuffer::new(""),
             login_password: TextBuffer::new(""),
@@ -98,7 +101,10 @@ impl DemoApp {
 
     pub fn frame(&mut self, width: f32, height: f32, scale: f32, timestamp_ms: f64) -> FrameOutput {
         self.resolve_pending(timestamp_ms);
-        let events = std::mem::take(&mut self.events);
+        // Task 4.7: drain into reusable scratch buffer instead of allocating a new Vec each frame.
+        self.events_scratch.clear();
+        self.events_scratch.append(&mut self.events);
+        let events = std::mem::take(&mut self.events_scratch);
         self.ui.begin_frame(events, width, height, scale, timestamp_ms);
 
         self.ui.label("GPU Forms UI");
@@ -142,7 +148,7 @@ impl DemoApp {
         if self.auth_mode == 0 {
             self.ui.label("Login");
             self.ui.text_input("Email", &mut self.login_email, "email@example.com");
-            self.ui.text_input("Password", &mut self.login_password, "password");
+            self.ui.password_input("Password", &mut self.login_password, "password");
             if self.ui.button("Submit Login") {
                 let mut form = self.login_form.clone();
                 let _ = form.set_value(&FormPath(vec!["email".into()]), FieldValue::Text(self.login_email.text().to_string()));
@@ -158,8 +164,8 @@ impl DemoApp {
         } else {
             self.ui.label("Register");
             self.ui.text_input("Email", &mut self.register_email, "email@example.com");
-            self.ui.text_input("Password", &mut self.register_password, "password");
-            self.ui.text_input("Confirm Password", &mut self.register_confirm, "confirm");
+            self.ui.password_input("Password", &mut self.register_password, "password");
+            self.ui.password_input("Confirm Password", &mut self.register_confirm, "confirm");
             let roles = vec!["User".to_string(), "Admin".to_string(), "Viewer".to_string()];
             self.ui.select("Role", &roles, &mut self.register_role);
             if self.ui.button("Submit Register") {
@@ -207,7 +213,12 @@ impl DemoApp {
 
     fn build_nested(&mut self, timestamp_ms: f64) {
         self.ui.label("Nested Groups");
-        self.ui.text_input("Full Name", &mut self.nested_name, "Jane Doe");
+        // Task 3.1: demonstrate horizontal row — first name and last name side by side
+        self.ui.label("Name (row layout demo):");
+        self.ui.begin_row(12.0);
+        self.ui.text_input("First Name", &mut self.nested_name, "Jane");
+        self.ui.text_input("Last Name", &mut self.nested_email, "Doe");
+        self.ui.end_row();
         self.ui.text_input("Contact Email", &mut self.nested_email, "jane@domain.com");
         if self.ui.button("Add Contact") {
             self.nested_contacts
@@ -256,6 +267,12 @@ impl DemoApp {
         self.show_loading(pending);
     }
 
+    /// Submit a form using a mock timer to simulate network latency.
+    ///
+    /// This mock approach (via `PendingMock` / `complete_at`) keeps the demo
+    /// self-contained and runnable without a real server. For production use,
+    /// see `crate::http::post_json`, which performs a real async `fetch` call
+    /// via `wasm-bindgen-futures`.
     fn submit_form(&mut self, kind: FormKind, form: &mut Form, timestamp_ms: f64) {
         let payload = serde_json::json!({ "timestamp": timestamp_ms });
         match form.start_submit(payload, 2) {
@@ -303,6 +320,38 @@ impl DemoApp {
         self.clipboard_request.take()
     }
 
+    /// Task 3.5: Pass prefers-reduced-motion from JS to the UI.
+    pub fn set_reduce_motion(&mut self, reduce: bool) {
+        self.ui.set_reduce_motion(reduce);
+    }
+
+    /// Task 3.6: Pass safe area insets from JS to the UI.
+    pub fn set_safe_area_insets(&mut self, top: f32, right: f32, bottom: f32, left: f32) {
+        self.ui.set_safe_area_insets(top, right, bottom, left);
+    }
+
+    /// Task 6.5: Switch between light and dark theme.
+    pub fn set_dark_mode(&mut self, dark: bool) {
+        self.ui.theme = if dark {
+            Theme::default_dark()
+        } else {
+            Theme::default_light()
+        };
+    }
+
+    /// Task 6.1: Handle autofill from password manager.
+    pub fn handle_autofill(&mut self, field: String, value: String) {
+        match field.as_str() {
+            "email" => {
+                self.login_email = TextBuffer::new(&value);
+            }
+            "password" => {
+                self.login_password = TextBuffer::new(&value);
+            }
+            _ => {}
+        }
+    }
+
     pub fn handle_pointer_down(&mut self, x: f32, y: f32, button: u16, ctrl: bool, alt: bool, shift: bool, meta: bool) {
         let event = InputEvent::PointerDown(PointerEvent {
             pos: ui_core::types::Vec2::new(x, y),
@@ -339,17 +388,17 @@ impl DemoApp {
         self.events.push(event);
     }
 
-    pub fn handle_key_down(&mut self, code: u32, ctrl: bool, alt: bool, shift: bool, meta: bool) {
+    pub fn handle_key_down(&mut self, code: String, ctrl: bool, alt: bool, shift: bool, meta: bool) {
         let event = InputEvent::KeyDown {
-            code: map_key(code),
+            code: map_key(&code),
             modifiers: Modifiers { ctrl, alt, shift, meta },
         };
         self.events.push(event);
     }
 
-    pub fn handle_key_up(&mut self, code: u32, ctrl: bool, alt: bool, shift: bool, meta: bool) {
+    pub fn handle_key_up(&mut self, code: String, ctrl: bool, alt: bool, shift: bool, meta: bool) {
         let event = InputEvent::KeyUp {
-            code: map_key(code),
+            code: map_key(&code),
             modifiers: Modifiers { ctrl, alt, shift, meta },
         };
         self.events.push(event);
@@ -409,29 +458,29 @@ fn map_button(button: u16) -> PointerButton {
     }
 }
 
-fn map_key(code: u32) -> KeyCode {
+fn map_key(code: &str) -> KeyCode {
     match code {
-        8  => KeyCode::Backspace,
-        9  => KeyCode::Tab,
-        13 => KeyCode::Enter,
-        27 => KeyCode::Escape,
-        45 => KeyCode::Insert,
-        46 => KeyCode::Delete,
-        37 => KeyCode::ArrowLeft,
-        38 => KeyCode::ArrowUp,
-        39 => KeyCode::ArrowRight,
-        40 => KeyCode::ArrowDown,
-        36 => KeyCode::Home,
-        35 => KeyCode::End,
-        33 => KeyCode::PageUp,
-        34 => KeyCode::PageDown,
-        65 => KeyCode::A,
-        67 => KeyCode::C,
-        86 => KeyCode::V,
-        88 => KeyCode::X,
-        90 => KeyCode::Z,
-        89 => KeyCode::Y,
-        other => KeyCode::Other(other),
+        "Backspace"  => KeyCode::Backspace,
+        "Tab"        => KeyCode::Tab,
+        "Enter"      => KeyCode::Enter,
+        "Escape"     => KeyCode::Escape,
+        "Insert"     => KeyCode::Insert,
+        "Delete"     => KeyCode::Delete,
+        "ArrowLeft"  => KeyCode::ArrowLeft,
+        "ArrowUp"    => KeyCode::ArrowUp,
+        "ArrowRight" => KeyCode::ArrowRight,
+        "ArrowDown"  => KeyCode::ArrowDown,
+        "Home"       => KeyCode::Home,
+        "End"        => KeyCode::End,
+        "PageUp"     => KeyCode::PageUp,
+        "PageDown"   => KeyCode::PageDown,
+        "KeyA"       => KeyCode::A,
+        "KeyC"       => KeyCode::C,
+        "KeyV"       => KeyCode::V,
+        "KeyX"       => KeyCode::X,
+        "KeyZ"       => KeyCode::Z,
+        "KeyY"       => KeyCode::Y,
+        other        => KeyCode::Other(other.to_string()),
     }
 }
 

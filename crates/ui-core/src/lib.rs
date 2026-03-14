@@ -1,8 +1,10 @@
 pub mod accessibility;
 pub mod batch;
+pub mod bidi;
 pub mod form;
 pub mod hit_test;
 pub mod input;
+pub mod metrics;
 pub mod rest;
 pub mod state;
 pub mod text;

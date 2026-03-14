@@ -37,6 +37,9 @@ pub struct Batch {
     pub indices: Vec<u32>,
     pub commands: Vec<DrawCmd>,
     pub text_runs: Vec<TextRun>,
+    /// Task 4.1: Dirty-region tracking. Set whenever a quad is added/changed;
+    /// cleared after the renderer uploads the vertex data.
+    pub dirty: bool,
 }
 
 impl Batch {
@@ -45,9 +48,11 @@ impl Batch {
         self.indices.clear();
         self.commands.clear();
         self.text_runs.clear();
+        self.dirty = false;
     }
 
     pub fn push_quad(&mut self, quad: Quad, material: Material, clip: Option<Rect>) {
+        self.dirty = true;
         let base = self.vertices.len() as u32;
         let rect = quad.rect;
         let uv = quad.uv;
@@ -104,6 +109,7 @@ impl Batch {
         });
     }
 }
+
 
 #[derive(Clone, Debug)]
 pub struct TextRun {

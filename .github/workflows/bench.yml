@@ -1,0 +1,32 @@
+name: Performance Benchmarks
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: Build WASM
+        run: wasm-pack build crates/ui-wasm --target web --release
+      - name: Check binary size
+        run: |
+          SIZE=$(gzip -c crates/ui-wasm/pkg/ui_wasm_bg.wasm | wc -c)
+          echo "WASM gzipped size: ${SIZE} bytes"
+          if [ "$SIZE" -gt 524288 ]; then
+            echo "::error::WASM binary exceeds 500KB gzipped (${SIZE} bytes)"
+            exit 1
+          fi
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Run frame time benchmark
+        run: |
+          cd examples/web
+          echo "Frame time benchmark: TODO (requires headless browser)"
+          echo "WASM_SIZE=${SIZE}" >> $GITHUB_STEP_SUMMARY

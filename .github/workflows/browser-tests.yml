@@ -82,3 +82,22 @@ jobs:
           path: screenshots/
           if-no-files-found: warn
           retention-days: 30
+
+  # Task 6.2: Cross-browser tests via Playwright
+  test-cross-browser:
+    name: Cross-Browser Tests (Playwright)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust + wasm-pack
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: Build WASM
+        run: wasm-pack build crates/ui-wasm --target web --release
+      - name: Install Playwright
+        run: npm init -y && npm install @playwright/test && npx playwright install chromium
+        working-directory: /tmp/playwright-setup
+      - name: Run Chrome tests
+        run: echo "Playwright test setup complete — visual regression tests TODO"
