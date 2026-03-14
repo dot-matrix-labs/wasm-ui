@@ -179,3 +179,23 @@
 | Novelty | 4/10 | Synthesizes known information; does not contribute new analysis or measurements |
 
 **Overall: 6/10.** A solid first draft that would benefit from (1) cutting the advocacy framing, (2) adding quantitative measurements, (3) discussing multi-memory and OOM failure modes, (4) including failure case studies alongside success stories, and (5) adding citations throughout. In its current form, it is a useful onboarding document for engineers new to Wasm memory management but falls short of the "technically rigorous" standard claimed in its preamble.
+
+---
+
+## 9. Addendum: Revision Notes (March 2026)
+
+The paper has been revised to address two critical gaps identified in this review and in subsequent analysis:
+
+### 9.1 GPU Memory Constraints (new §5)
+
+The paper now includes a dedicated section on GPU-side memory constraints for applications that render via WebGL/WebGPU. This section covers: the three-heap memory model (Wasm linear memory + JS heap + GPU memory), texture atlas memory accounting, glyph cache growth in form-heavy applications, GPU context loss and its architectural implications, and GPU memory budgeting for mobile devices. This was a significant omission given that the paper's primary audience includes engineers building GPU-rendered Wasm applications.
+
+### 9.2 Rendering Architecture Analysis (new §6)
+
+The paper now analyzes how the choice between immediate-mode and retained-mode rendering architectures shapes the memory profile of a Wasm UI application. This includes: memory characteristics of each approach (widget tree persistence, fragmentation risk, arena suitability), risks specific to each mode (GPU buffer churn for immediate, widget lifecycle leaks for retained), hybrid approaches (Xilem, Makepad), and a concrete recommendation for the forms-focused use case. The recommendation—that immediate-mode or immediate-mode-hybrid architectures are strongly favored for memory reasons—is well-supported by the analysis and directly addresses the paper's central concern about fragmentation in a grow-only memory model.
+
+### 9.3 Revised assessment
+
+With these additions, the paper's completeness improves materially. The rendering architecture section in particular fills what was arguably the largest analytical gap: the paper previously discussed memory constraints in the abstract without connecting them to the architectural decisions that determine whether those constraints are manageable or catastrophic. The GPU memory section closes the gap between "Wasm linear memory" analysis and the reality that GPU-rendered applications have a second, often larger memory domain to manage.
+
+The remaining gaps from the original review (quantitative data, multi-memory proposal, OOM failure modes, failure case studies, citations) are still unaddressed and still matter.

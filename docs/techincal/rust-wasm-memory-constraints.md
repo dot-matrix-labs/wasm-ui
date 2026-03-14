@@ -1,6 +1,6 @@
 # Rust → WebAssembly Memory Constraints in Modern Browsers: Risks, Failure Modes, and Production Mitigations
 
-**Abstract.** WebAssembly (Wasm) has matured from an experimental compilation target into a production-grade execution environment deployed by some of the largest software companies in the world. Rust, with its ownership model and zero-cost abstractions, has emerged as the dominant systems language for Wasm-targeted browser applications. This paper provides a systematic analysis of the memory constraints, failure modes, and architectural implications of Rust code compiled to WebAssembly and executed within modern browser engines. We construct a taxonomy of memory risks spanning Rust-specific hazards, Wasm-model hazards, and cross-boundary amplification effects. We then present a layered mitigation playbook drawn from production deployments. The intended audience is systems engineers, browser platform engineers, and security researchers working with or evaluating Wasm-based architectures.
+**Abstract.** WebAssembly (Wasm) has matured from an experimental compilation target into a production-grade execution environment deployed by some of the largest software companies in the world. Rust, with its ownership model and zero-cost abstractions, has emerged as the dominant systems language for Wasm-targeted browser applications. This paper provides a systematic analysis of the memory constraints, failure modes, and architectural implications of Rust code compiled to WebAssembly and executed within modern browser engines. We construct a taxonomy of memory risks spanning Rust-specific hazards, Wasm-model hazards, and cross-boundary amplification effects. We examine GPU-side memory constraints for applications that render via WebGL or WebGPU, and analyze how the choice between immediate-mode and retained-mode rendering architectures shapes the memory profile and determines which mitigations are effective. We then present a layered mitigation playbook drawn from production deployments. The intended audience is systems engineers, browser platform engineers, and security researchers working with or evaluating Wasm-based architectures.
 
 ---
 
@@ -135,7 +135,7 @@
 - **dlmalloc** (the `wee_alloc` replacement and default in many configurations): A port of Doug Lea's malloc, adapted for Wasm. It manages free lists and bins within linear memory and calls `memory.grow` when it needs more pages.
 - **wee_alloc** (deprecated but still encountered): A deliberately small (~1 KB code size) allocator designed for code-size-sensitive Wasm deployments. Known for poor fragmentation behavior and inability to return memory to the system.
 - **talc**: A more recent allocator designed specifically for Wasm, with better fragmentation characteristics.
-- **Custom arena allocators**: Many production Wasm applications bypass the general-purpose allocator entirely for hot paths, using arena or bump allocators (discussed in §5.3).
+- **Custom arena allocators**: Many production Wasm applications bypass the general-purpose allocator entirely for hot paths, using arena or bump allocators (discussed in §7.3).
 
 3.4.3. All of these allocators face a fundamental constraint: they can request more pages from `memory.grow`, but they **cannot return pages to the Wasm runtime**. When a Rust program calls `dealloc`, the allocator marks the memory as available for future allocations within its own data structures, but the underlying Wasm pages remain committed. From the browser's perspective, the memory is still in use.
 
@@ -218,17 +218,149 @@ These are problems present in both ecosystems but amplified by the introduction 
 
 ---
 
-## 5. Mitigation Strategies
+## 5. GPU Memory Constraints
+
+The preceding sections focus exclusively on Wasm linear memory. However, applications that render UI via WebGL or WebGPU—which is the entire premise of GPU-accelerated Wasm UI frameworks—maintain a second, largely invisible memory domain: GPU-side allocations. These allocations are not reflected in Wasm linear memory metrics, are not subject to the same grow-only constraints, and have their own failure modes that the paper must address.
+
+### 5.1 The GPU Memory Domain
+
+5.1.1. A GPU-rendered Wasm application manages memory across three distinct heaps: (1) Wasm linear memory (the Rust heap), (2) the JavaScript/browser heap, and (3) GPU memory managed by the WebGL/WebGPU driver. The paper's taxonomy (§4) covers only the first two. GPU memory is allocated through API calls (`gl.texImage2D`, `gl.bufferData`, `device.createBuffer`, `device.createTexture`) and lives outside Wasm linear memory entirely. Browser DevTools memory panels typically do not report GPU allocations alongside Wasm memory, making GPU memory leaks invisible to the monitoring strategies described in §7.1 of the mitigation playbook.
+
+5.1.2. GPU memory is a shared, contention-prone resource. Unlike Wasm linear memory (which is per-instance and isolated), GPU memory is shared across all tabs, all contexts, and the compositor. On mobile devices with unified memory architectures (most ARM SoCs), GPU allocations compete directly with CPU allocations for the same physical RAM. A Wasm application that monitors only its linear memory usage may believe it is within budget while its GPU allocations push the device into memory pressure, causing the OS to kill background tabs or the application itself.
+
+### 5.2 Texture Memory
+
+5.2.1. **Texture atlases** are the dominant GPU memory consumer in 2D UI rendering. A forms-focused UI framework must maintain atlases for glyph caches (rendered text), icon sheets, and potentially image content. A single RGBA texture atlas at 2048×2048 consumes 16 MB of GPU memory. At 4096×4096 (common for high-DPI glyph caches), it consumes 64 MB. Multiple atlases—one for glyphs, one for icons, one for UI chrome—can easily exceed the Wasm linear memory footprint of the application logic itself.
+
+5.2.2. **Glyph cache growth** is particularly dangerous for form-heavy applications. Each unique (font, size, weight, glyph) combination occupies atlas space. A form with multiple font styles, multilingual content (Latin + CJK glyphs), and dynamic sizing can exhaust a glyph atlas quickly. Unlike Wasm linear memory, texture atlases *can* be destroyed and recreated—but doing so mid-frame produces visual artifacts. The glyph cache eviction strategy directly affects both memory usage and rendering correctness.
+
+5.2.3. **Texture upload latency.** Uploading texture data from Wasm linear memory to the GPU (`texImage2D`, `texSubImage2D`, `queue.writeTexture`) requires the data to exist simultaneously in Wasm linear memory (source) and GPU memory (destination). For large atlas updates, this doubles the peak memory cost of the texture data. Streaming uploads (updating sub-regions) mitigate this but add implementation complexity.
+
+### 5.3 Buffer Objects
+
+5.3.1. **Vertex and index buffers** for UI rendering are typically small per-frame (a forms UI draws hundreds to low thousands of quads), but buffer management strategy matters. Allocating new GPU buffers every frame and relying on garbage collection to reclaim old ones produces GPU memory churn and eventual pressure. Persistent buffers that are updated via `bufferSubData` or mapped writes avoid this but require careful sizing.
+
+5.3.2. **Uniform buffers and bind groups** (WebGPU) or uniform uploads (WebGL) consume GPU memory proportional to the number of distinct materials, transforms, or rendering states. A UI framework with per-widget styling (colors, borders, shadows) may generate more uniform data than expected.
+
+### 5.4 GPU Context Loss
+
+5.4.1. WebGL contexts can be lost at any time due to GPU memory pressure, driver crashes, or system policies (notably on mobile where the OS reclaims GPU resources from backgrounded tabs). A lost context invalidates **all** GPU resources: textures, buffers, shaders, framebuffers. The application must be able to recreate its entire GPU state from data retained in Wasm linear memory or JavaScript.
+
+5.4.2. This has a direct architectural implication: GPU resources cannot be the sole source of truth for any application state. The glyph cache, texture atlases, and rendering state must be reconstructable from CPU-side data. This means the application effectively maintains a shadow copy of its GPU state, increasing total memory usage but providing resilience against context loss. Applications that fail to handle context loss will render a black screen or crash after a GPU memory pressure event—a common failure on mobile browsers that the paper's risk taxonomy should include.
+
+5.4.3. WebGPU's `device.lost` promise provides a cleaner recovery path than WebGL's context loss events, but the fundamental constraint is the same: GPU memory is ephemeral and the application must plan for total loss.
+
+### 5.5 GPU Memory Budgeting
+
+5.5.1. There is no reliable cross-browser API for querying available GPU memory. The `WEBGL_debug_renderer_info` extension reveals the GPU vendor and model (from which memory can be heuristically estimated), but provides no runtime usage data. Applications must set conservative GPU memory budgets based on target device profiles:
+
+- Low-end mobile (Adreno 610, Mali-G57): ~1–2 GB shared CPU/GPU, effective GPU budget 100–200 MB.
+- Mid-range mobile (Adreno 730, Mali-G710): ~4–6 GB shared, effective GPU budget 200–500 MB.
+- Desktop (discrete GPU): 2–16 GB dedicated VRAM, but browser tab limits apply.
+
+5.5.2. For a forms-focused application targeting mid-range mobile (per the project's success criteria), a practical GPU memory budget is: one 2048×2048 glyph atlas (16 MB), one 1024×1024 icon atlas (4 MB), persistent vertex/index buffers (< 1 MB), and shader programs (< 5 MB compiled). Total: ~25–30 MB. This is modest but must be actively managed—glyph cache eviction, atlas packing efficiency, and buffer reuse are not optional optimizations but correctness requirements on constrained devices.
+
+---
+
+## 6. Rendering Architecture and Memory Implications
+
+The choice between immediate-mode and retained-mode rendering is the single most consequential architectural decision for the memory profile of a GPU-rendered Wasm UI application. This section analyzes both approaches and their interaction with the Wasm memory constraints described in §§3–5.
+
+### 6.1 Immediate-Mode Rendering
+
+6.1.1. In an immediate-mode architecture (exemplified by Dear ImGui, egui, and Makepad), the application reconstructs the entire UI description every frame. There is no persistent widget tree. The application calls drawing functions (`button("Submit")`, `text_input("Name", &mut name)`) that both define the UI and handle interaction in a single pass. The output is a list of draw commands (vertex data, texture references, scissor rects) that is submitted to the GPU and discarded.
+
+6.1.2. **Memory characteristics of immediate mode:**
+
+- **No persistent widget tree.** Memory usage is proportional to the visible UI, not the total UI. A 500-field form where only 20 fields are visible allocates memory only for the 20 visible fields. This is a natural form of virtualization.
+- **Arena allocation is the natural fit.** The per-frame draw list is allocated into an arena that is reset at frame end. This perfectly aligns with the arena mitigation strategy (§7.3.1) and eliminates fragmentation from UI allocations. The Wasm linear memory high-water mark from UI rendering is bounded by the worst-case single frame, not accumulated over the session.
+- **Lower steady-state memory.** No widget objects, no layout caches, no style resolution trees, no event dispatch tables. The only persistent state is the application's data model.
+- **Higher per-frame CPU cost.** Rebuilding the UI every frame means layout computation, text measurement, and hit-testing happen every frame. On a 120Hz display (8.3ms frame budget), this can be expensive for complex forms.
+- **Predictable memory profile.** Memory usage is bounded and periodic: it spikes during frame construction, drops to baseline after frame submission. This is the "predictable memory phases" pattern (§7.6.3) achieved by default rather than by careful engineering.
+
+6.1.3. **Risks specific to immediate mode:**
+
+- **Text measurement cost.** Measuring text layout every frame is expensive. Immediate-mode frameworks typically cache text measurements, which reintroduces persistent state and its associated memory. The cache must be bounded or it becomes a leak.
+- **GPU buffer churn.** Generating new vertex data every frame means uploading new vertex buffers to the GPU every frame. On low-end GPUs, this upload bandwidth can become the bottleneck rather than memory.
+- **State management complexity.** Without a widget tree, state that "belongs to" a widget (scroll position, animation progress, focus state) must be stored externally, typically in hash maps keyed by widget identity. These maps grow over the session and can leak if widget identities are not stable.
+
+### 6.2 Retained-Mode Rendering
+
+6.2.1. In a retained-mode architecture (exemplified by Flutter, the browser DOM, Druid/Xilem, and most traditional UI toolkits), the application constructs a persistent tree of widget objects. The framework diffs the new tree against the previous tree, computes a minimal set of changes, and updates the rendering accordingly.
+
+6.2.2. **Memory characteristics of retained mode:**
+
+- **Persistent widget tree.** Memory usage is proportional to the total UI, not the visible UI (unless explicit virtualization is implemented). A 500-field form allocates 500 widget nodes, their layout data, style data, and accessibility metadata, regardless of how many are on screen. For a forms application, this is typically tens to low hundreds of KB—manageable but non-trivial.
+- **Layout caches.** Retained-mode frameworks cache layout results (position, size, baseline) per widget. This avoids recomputation but adds per-widget memory overhead. For complex layouts with constraints (flexbox-like), the cache may include constraint inputs and intermediate results.
+- **Style resolution data.** If the framework supports theming or cascading styles, each widget may store resolved style properties. This adds per-widget overhead proportional to the number of style properties.
+- **Diffing intermediaries.** Tree diffing algorithms (reconciliation) allocate temporary data structures to compare old and new trees. This creates periodic memory spikes during UI updates that contribute to the high-water mark.
+- **Fragmentation risk.** Widgets are individually heap-allocated and have varied lifetimes (some persist for the session, others are created and destroyed as the user navigates). This allocation pattern—many small, variably-lived objects—is the worst case for heap fragmentation in a grow-only memory model.
+
+6.2.3. **Risks specific to retained mode:**
+
+- **Widget lifecycle leaks.** A retained widget tree can leak memory when widgets are "removed" from the visible tree but retain references (event handlers, animation controllers, data bindings) that prevent deallocation. This is the Wasm analog of DOM detached-node leaks in browsers, but harder to diagnose because Wasm has no equivalent of Chrome's "Detached DOM elements" heap snapshot filter.
+- **Unbounded tree growth.** Dynamic forms that add and remove fields over a session (conditional sections, repeatable groups) cause the widget tree to churn. Even if widgets are correctly deallocated, the allocator fragmentation from repeated create/destroy cycles permanently inflates linear memory.
+- **Virtualization is essential, not optional.** A retained-mode framework that does not virtualize long lists or large forms will allocate proportionally to total content. For a 500-field form, this is manageable; for a data table with 10,000 rows, it is not. Virtualization (rendering only visible rows with placeholder measurements for off-screen rows) is a correctness requirement, not a performance optimization.
+
+### 6.3 Hybrid Approaches
+
+6.3.1. Several modern frameworks adopt hybrid strategies:
+
+- **Xilem** (Rust) uses a retained widget tree but reconstructs the view description every frame (like immediate mode), then diffs against the retained tree. This gives the ergonomics of immediate mode with the rendering efficiency of retained mode, but the memory profile is closer to retained mode because the persistent tree exists.
+- **Makepad** (Rust/Wasm) uses an immediate-mode API with GPU-side retained state (persistent vertex buffers, cached draw calls). This inverts the typical trade-off: CPU-side memory is immediate-mode-minimal while GPU-side memory is retained.
+- **React-like reconciliation in Rust** (Dioxus, Leptos, Sycamore) uses a virtual DOM or signal graph with diffing. These have retained-mode memory characteristics plus the overhead of the diffing data structures.
+
+6.3.2. For a Wasm forms framework operating under the memory constraints of §§3–5, the choice has concrete implications:
+
+| Concern | Immediate Mode | Retained Mode |
+|---|---|---|
+| Wasm linear memory baseline | Lower (no widget tree) | Higher (persistent tree) |
+| Peak memory during interaction | Bounded per-frame | Spikes during reconciliation |
+| Fragmentation risk | Low (arena per frame) | High (varied-lifetime allocations) |
+| GPU memory profile | Higher churn (new buffers/frame) | Lower churn (incremental updates) |
+| Glyph cache pressure | Same | Same |
+| Suitability for arena allocation | Excellent | Poor (long-lived objects) |
+| Memory predictability | High | Depends on implementation |
+
+### 6.4 Recommendation for This Project
+
+6.4.1. Given the project's constraints—forms-first, targeting mid-range mobile at 60fps, Wasm + WebGL/WebGPU rendering, <500KB bundle—the rendering architecture should be chosen with memory as a primary design axis, not just performance:
+
+6.4.2. **An immediate-mode or immediate-mode-hybrid architecture is strongly favored** for the following memory-specific reasons:
+
+- Arena allocation per frame eliminates the fragmentation problem that is the paper's central concern (§4.2.5). In a grow-only memory model, avoiding fragmentation is more valuable than any mitigation strategy for managing it.
+- The forms use case is low to moderate complexity per frame (tens to hundreds of widgets visible), well within immediate-mode CPU budgets even at 120Hz.
+- GPU buffer uploads for a forms UI are small (a few thousand vertices per frame). The buffer churn cost of immediate mode is negligible for this workload.
+- No widget lifecycle leaks are possible when there are no persistent widget objects.
+- Memory predictability—bounded, periodic, resettable—is achieved by default.
+
+6.4.3. **The retained-mode approach is viable but requires more defensive engineering:**
+
+- Per-widget allocation should use a typed arena or object pool, not the general-purpose allocator, to control fragmentation.
+- Virtualization must be implemented from day one for any scrollable content.
+- Widget lifecycle must be rigorously managed with explicit destroy phases and leak detection instrumentation.
+- The memory budgeting strategy (§7.5.2) becomes essential rather than aspirational.
+
+6.4.4. **GPU memory management applies equally to both architectures.** Regardless of rendering mode, the application must:
+
+- Implement glyph cache eviction (LRU or LFU) with a bounded atlas size.
+- Handle WebGL context loss and full GPU state reconstruction.
+- Budget GPU memory separately from Wasm linear memory.
+- Use persistent, pre-sized vertex/index buffers rather than per-frame allocation where possible (even in immediate mode, the *GPU-side* buffers should be retained and overwritten, not recreated).
+
+---
+
+## 7. Mitigation Strategies
 
 The following mitigations are organized from lowest barrier to adoption (tooling and configuration changes) to highest (fundamental architectural redesign). Production Wasm applications typically employ strategies from multiple levels simultaneously.
 
-### 5.1 Tooling Choices
+### 7.1 Tooling Choices
 
-5.1.1. **Browser DevTools memory profilers.** Chrome DevTools provides a "Memory" tab that can profile both the JavaScript heap and Wasm linear memory. The heap snapshot view shows JavaScript objects, while the "Memory" allocation timeline can track `ArrayBuffer` growth (which corresponds to Wasm linear memory growth). Firefox's memory tool provides similar capabilities. Engineers should use these tools to establish baseline memory profiles for typical workloads and identify unexpected growth.
+7.1.1. **Browser DevTools memory profilers.** Chrome DevTools provides a "Memory" tab that can profile both the JavaScript heap and Wasm linear memory. The heap snapshot view shows JavaScript objects, while the "Memory" allocation timeline can track `ArrayBuffer` growth (which corresponds to Wasm linear memory growth). Firefox's memory tool provides similar capabilities. Engineers should use these tools to establish baseline memory profiles for typical workloads and identify unexpected growth.
 
-5.1.2. **`wasm-objdump` and `wasm-dis`.** The WebAssembly Binary Toolkit (WABT) provides tools for inspecting compiled Wasm modules. `wasm-objdump -x` shows the memory section, including initial and maximum memory declarations. This is useful for verifying that the compiled module declares sensible memory bounds.
+7.1.2. **`wasm-objdump` and `wasm-dis`.** The WebAssembly Binary Toolkit (WABT) provides tools for inspecting compiled Wasm modules. `wasm-objdump -x` shows the memory section, including initial and maximum memory declarations. This is useful for verifying that the compiled module declares sensible memory bounds.
 
-5.1.3. **Rust allocator instrumentation.** Rust's `GlobalAlloc` trait allows wrapping the allocator with instrumentation. A custom global allocator can track:
+7.1.3. **Rust allocator instrumentation.** Rust's `GlobalAlloc` trait allows wrapping the allocator with instrumentation. A custom global allocator can track:
 
 - Total bytes allocated and freed.
 - Number of active allocations.
@@ -237,46 +369,46 @@ The following mitigations are organized from lowest barrier to adoption (tooling
 
 This instrumentation adds runtime overhead but provides application-level memory visibility that browser tools cannot. It is particularly valuable for identifying which subsystems are responsible for memory growth.
 
-5.1.4. **Twiggy.** The `twiggy` tool analyzes compiled Wasm binaries to identify which functions and data sections contribute most to code size. While primarily a code-size tool, it can also reveal unexpectedly large static data segments or bloated generic instantiations that increase the module's memory baseline.
+7.1.4. **Twiggy.** The `twiggy` tool analyzes compiled Wasm binaries to identify which functions and data sections contribute most to code size. While primarily a code-size tool, it can also reveal unexpectedly large static data segments or bloated generic instantiations that increase the module's memory baseline.
 
-5.1.5. **`console.memory` and `performance.measureUserAgentSpecificMemory()`.** These JavaScript APIs provide programmatic access to memory metrics. `performance.measureUserAgentSpecificMemory()` (available in Chrome behind cross-origin isolation) reports per-origin memory usage including Wasm memory. This enables automated memory regression testing.
+7.1.5. **`console.memory` and `performance.measureUserAgentSpecificMemory()`.** These JavaScript APIs provide programmatic access to memory metrics. `performance.measureUserAgentSpecificMemory()` (available in Chrome behind cross-origin isolation) reports per-origin memory usage including Wasm memory. This enables automated memory regression testing.
 
-### 5.2 Language and Library Choices
+### 7.2 Language and Library Choices
 
-5.2.1. **Minimize `unsafe` code.** Every `unsafe` block is a potential source of the Rust-exclusive memory risks described in §4.1. Production Wasm applications should:
+7.2.1. **Minimize `unsafe` code.** Every `unsafe` block is a potential source of the Rust-exclusive memory risks described in §4.1. Production Wasm applications should:
 
 - Audit all `unsafe` blocks and document their safety invariants.
 - Prefer safe abstractions from well-audited crates over custom `unsafe` implementations.
 - Use `#[forbid(unsafe_code)]` in modules that do not require `unsafe`.
 - Run `cargo clippy` with all lints enabled to catch common `unsafe` antipatterns.
 
-5.2.2. **Allocator selection.** The choice of allocator significantly affects fragmentation behavior and peak memory usage:
+7.2.2. **Allocator selection.** The choice of allocator significantly affects fragmentation behavior and peak memory usage:
 
 - `dlmalloc` (the default in many Wasm toolchains) provides reasonable general-purpose performance but can suffer from fragmentation in long-running workloads with varied allocation sizes.
 - `talc` is designed for Wasm and provides better fragmentation resistance through a different free-list strategy.
-- Custom allocators (arena, bump, pool) should be used for hot paths with known allocation patterns (§5.3).
+- Custom allocators (arena, bump, pool) should be used for hot paths with known allocation patterns (§7.3).
 
-5.2.3. **Avoid unnecessary serialization.** The interop boundary between JavaScript and Wasm is a major source of memory amplification (§4.3). Strategies to minimize interop copying include:
+7.2.3. **Avoid unnecessary serialization.** The interop boundary between JavaScript and Wasm is a major source of memory amplification (§4.3). Strategies to minimize interop copying include:
 
 - Use shared `ArrayBuffer` views where possible, avoiding full copies.
 - Design Wasm APIs that accept byte offsets and lengths rather than copying data in and out.
 - Use zero-copy deserialization formats (e.g., FlatBuffers, Cap'n Proto) instead of JSON or MessagePack.
 - Batch multiple small interop calls into single bulk transfers.
 
-5.2.4. **Stable interop APIs.** Define a narrow, stable ABI between JavaScript and Wasm. Each function in this ABI should have documented ownership semantics: does the Wasm function take ownership of the input buffer (and free it), or does the caller retain ownership? Ambiguous ownership at the interop boundary is the leading cause of double-free and use-after-free bugs in production Wasm applications.
+7.2.4. **Stable interop APIs.** Define a narrow, stable ABI between JavaScript and Wasm. Each function in this ABI should have documented ownership semantics: does the Wasm function take ownership of the input buffer (and free it), or does the caller retain ownership? Ambiguous ownership at the interop boundary is the leading cause of double-free and use-after-free bugs in production Wasm applications.
 
-### 5.3 Architecture and Design Patterns
+### 7.3 Architecture and Design Patterns
 
-5.3.1. **Arena allocation.** An arena (also called a region or zone) allocator pre-allocates a large contiguous block and provides fast bump-pointer allocation within that block. When the arena is "reset," all objects in the arena are freed simultaneously by resetting the bump pointer to the beginning—no per-object deallocation is needed. This pattern is transformative for Wasm applications because:
+7.3.1. **Arena allocation.** An arena (also called a region or zone) allocator pre-allocates a large contiguous block and provides fast bump-pointer allocation within that block. When the arena is "reset," all objects in the arena are freed simultaneously by resetting the bump pointer to the beginning—no per-object deallocation is needed. This pattern is transformative for Wasm applications because:
 
 - It eliminates fragmentation within the arena.
 - It makes deallocation O(1) regardless of the number of objects.
 - It naturally aligns with request/response or frame-based processing models.
 - It reduces the frequency of `memory.grow` calls because the arena is reused.
 
-5.3.2. **Scratch buffers.** Pre-allocate a set of reusable buffers for temporary data (image tiles, text encoding buffers, computation intermediaries). Rather than allocating and freeing buffers per operation, reuse the same buffers for each operation. This caps the memory overhead of temporary data at a fixed, predictable amount.
+7.3.2. **Scratch buffers.** Pre-allocate a set of reusable buffers for temporary data (image tiles, text encoding buffers, computation intermediaries). Rather than allocating and freeing buffers per operation, reuse the same buffers for each operation. This caps the memory overhead of temporary data at a fixed, predictable amount.
 
-5.3.3. **Streaming processing.** Instead of loading an entire dataset into memory, process it in chunks:
+7.3.3. **Streaming processing.** Instead of loading an entire dataset into memory, process it in chunks:
 
 - Image processing: process tiles rather than full images.
 - Document parsing: use SAX-style event-driven parsing rather than DOM-style tree construction.
@@ -284,29 +416,29 @@ This instrumentation adds runtime overhead but provides application-level memory
 
 Streaming reduces peak memory usage and avoids the linear-memory high-water-mark problem.
 
-5.3.4. **Chunked workloads.** For computationally intensive operations, break the work into chunks that can be processed incrementally. Between chunks, reuse temporary allocations. This prevents a single large computation from permanently inflating the linear memory.
+7.3.4. **Chunked workloads.** For computationally intensive operations, break the work into chunks that can be processed incrementally. Between chunks, reuse temporary allocations. This prevents a single large computation from permanently inflating the linear memory.
 
-5.3.5. **Worker lifecycle resets.** For applications where memory growth is unavoidable, run the Wasm module in a Web Worker and periodically terminate and recreate the worker. This is the only way to truly "free" Wasm linear memory: destroying the Wasm instance releases the backing `ArrayBuffer`. The new worker starts with a fresh, minimal linear memory. This pattern requires serializing and transferring essential state to the new worker, which adds complexity but provides a hard upper bound on memory growth.
+7.3.5. **Worker lifecycle resets.** For applications where memory growth is unavoidable, run the Wasm module in a Web Worker and periodically terminate and recreate the worker. This is the only way to truly "free" Wasm linear memory: destroying the Wasm instance releases the backing `ArrayBuffer`. The new worker starts with a fresh, minimal linear memory. This pattern requires serializing and transferring essential state to the new worker, which adds complexity but provides a hard upper bound on memory growth.
 
-5.3.6. **Handle-based APIs.** Instead of exposing Wasm pointers to JavaScript, expose integer handles (indices into an internal table). The Wasm module maintains a table mapping handles to internal pointers. This decouples the JavaScript code from the Wasm memory layout and prevents stale-pointer bugs when internal data structures are reorganized.
+7.3.6. **Handle-based APIs.** Instead of exposing Wasm pointers to JavaScript, expose integer handles (indices into an internal table). The Wasm module maintains a table mapping handles to internal pointers. This decouples the JavaScript code from the Wasm memory layout and prevents stale-pointer bugs when internal data structures are reorganized.
 
-### 5.4 Testing and Verification Patterns
+### 7.4 Testing and Verification Patterns
 
-5.4.1. **Fuzz testing.** Run `cargo fuzz` (which uses libFuzzer) against Wasm-targeted code. Fuzz testing is particularly effective at finding `unsafe` memory bugs because it can explore code paths that unit tests miss. For Wasm-specific testing, fuzz the interop boundary: generate random sequences of JavaScript→Wasm calls with random inputs and verify that the module does not trap unexpectedly.
+7.4.1. **Fuzz testing.** Run `cargo fuzz` (which uses libFuzzer) against Wasm-targeted code. Fuzz testing is particularly effective at finding `unsafe` memory bugs because it can explore code paths that unit tests miss. For Wasm-specific testing, fuzz the interop boundary: generate random sequences of JavaScript→Wasm calls with random inputs and verify that the module does not trap unexpectedly.
 
-5.4.2. **Property testing.** Use `proptest` or `quickcheck` to test invariants of data structures and algorithms. Property tests can verify, for example, that a data structure's size (in allocator bytes) is proportional to the number of elements it contains, catching memory leaks that would be invisible to functional tests.
+7.4.2. **Property testing.** Use `proptest` or `quickcheck` to test invariants of data structures and algorithms. Property tests can verify, for example, that a data structure's size (in allocator bytes) is proportional to the number of elements it contains, catching memory leaks that would be invisible to functional tests.
 
-5.4.3. **Load testing with large datasets.** Test with inputs at or above production scale. Many Wasm memory bugs are triggered only by inputs large enough to cause `memory.grow`. If the test suite uses only small inputs, these bugs will never be caught.
+7.4.3. **Load testing with large datasets.** Test with inputs at or above production scale. Many Wasm memory bugs are triggered only by inputs large enough to cause `memory.grow`. If the test suite uses only small inputs, these bugs will never be caught.
 
-5.4.4. **Stress testing memory growth.** Write tests that deliberately trigger `memory.grow` and verify correct behavior:
+7.4.4. **Stress testing memory growth.** Write tests that deliberately trigger `memory.grow` and verify correct behavior:
 
 - Allocate and free memory in patterns that maximize fragmentation.
 - Grow memory to the declared maximum and verify graceful failure (not a trap) when further growth is requested.
 - Verify that JavaScript interop code correctly handles `ArrayBuffer` detachment after growth.
 
-5.4.5. **Long-running session tests.** Run automated sessions that simulate hours of user interaction. Monitor memory usage over time and alert on monotonic growth. Many memory leaks in Wasm applications are slow—a few kilobytes per interaction—and only become visible after hundreds or thousands of operations.
+7.4.5. **Long-running session tests.** Run automated sessions that simulate hours of user interaction. Monitor memory usage over time and alert on monotonic growth. Many memory leaks in Wasm applications are slow—a few kilobytes per interaction—and only become visible after hundreds or thousands of operations.
 
-5.4.6. **Miri.** Run the test suite under Miri (`cargo +nightly miri test`) to detect undefined behavior in `unsafe` code. Miri is an interpreter for Rust's MIR (Mid-level IR) that can detect:
+7.4.6. **Miri.** Run the test suite under Miri (`cargo +nightly miri test`) to detect undefined behavior in `unsafe` code. Miri is an interpreter for Rust's MIR (Mid-level IR) that can detect:
 
 - Use-after-free.
 - Out-of-bounds memory access.
@@ -315,11 +447,11 @@ Streaming reduces peak memory usage and avoids the linear-memory high-water-mark
 
 Miri does not target Wasm directly, but most `unsafe` bugs are independent of the compilation target and will be detected in native Miri execution.
 
-### 5.5 Engineering Discipline
+### 7.5 Engineering Discipline
 
-5.5.1. **Strict ownership boundaries.** Define clear ownership for every piece of data that crosses the JS/Wasm boundary. Document whether the caller or callee is responsible for freeing each buffer. Use Rust's type system to enforce ownership within the Wasm module; use documentation and code review to enforce it at the interop boundary.
+7.5.1. **Strict ownership boundaries.** Define clear ownership for every piece of data that crosses the JS/Wasm boundary. Document whether the caller or callee is responsible for freeing each buffer. Use Rust's type system to enforce ownership within the Wasm module; use documentation and code review to enforce it at the interop boundary.
 
-5.5.2. **Memory budgeting.** Establish per-subsystem memory budgets:
+7.5.2. **Memory budgeting.** Establish per-subsystem memory budgets:
 
 - The rendering engine may use up to X MB of linear memory.
 - The document model may use up to Y MB.
@@ -327,14 +459,14 @@ Miri does not target Wasm directly, but most `unsafe` bugs are independent of th
 
 Instrument allocators to report per-subsystem usage and alert when budgets are exceeded. This transforms memory usage from an emergent, uncontrolled property into a designed, monitored constraint.
 
-5.5.3. **Explicit lifecycle phases.** Design the application with explicit memory lifecycle phases:
+7.5.3. **Explicit lifecycle phases.** Design the application with explicit memory lifecycle phases:
 
 - **Initialization**: Load the module, allocate long-lived data structures, establish baselines.
 - **Steady state**: Process user interactions within pre-allocated budgets.
 - **Peak processing**: Handle large operations (file import, export, complex computation) with temporary arena allocations that are released immediately.
 - **Teardown**: Destroy the module instance if the session is ending, or reset arenas and scratch buffers to return to steady state.
 
-5.5.4. **Interop contracts.** Define and enforce contracts for every function in the JS/Wasm API surface:
+7.5.4. **Interop contracts.** Define and enforce contracts for every function in the JS/Wasm API surface:
 
 - What type and size of data does the function accept?
 - Does the function allocate memory? If so, how much?
@@ -344,30 +476,30 @@ Instrument allocators to report per-subsystem usage and alert when budgets are e
 
 These contracts should be documented in the API definition and verified by tests.
 
-### 5.6 Architectural Wisdom
+### 7.6 Architectural Wisdom
 
-5.6.1. **Treat Wasm memory as a bounded system resource.** Linear memory is not an infinite heap. It is a finite, grow-only resource analogous to a fixed-size buffer pool in an embedded system. Design for it accordingly:
+7.6.1. **Treat Wasm memory as a bounded system resource.** Linear memory is not an infinite heap. It is a finite, grow-only resource analogous to a fixed-size buffer pool in an embedded system. Design for it accordingly:
 
 - Never assume that `memory.grow` will succeed.
 - Never assume that memory will be returned to the system after use.
 - Always have a plan for what happens when memory is exhausted.
 
-5.6.2. **Avoid unbounded workloads.** Any operation that allocates memory proportional to input size is a potential memory bomb. Impose limits on input sizes, processing batch sizes, and intermediate data structure sizes. Reject or decompose inputs that would exceed memory budgets rather than attempting to process them and hoping for the best.
+7.6.2. **Avoid unbounded workloads.** Any operation that allocates memory proportional to input size is a potential memory bomb. Impose limits on input sizes, processing batch sizes, and intermediate data structure sizes. Reject or decompose inputs that would exceed memory budgets rather than attempting to process them and hoping for the best.
 
-5.6.3. **Design predictable memory phases.** An application whose memory usage follows a predictable pattern—stable baseline, bounded peaks, return to baseline—is far easier to operate than one whose memory usage is an unpredictable function of user behavior. Design the application's data flow to produce predictable memory phases:
+7.6.3. **Design predictable memory phases.** An application whose memory usage follows a predictable pattern—stable baseline, bounded peaks, return to baseline—is far easier to operate than one whose memory usage is an unpredictable function of user behavior. Design the application's data flow to produce predictable memory phases:
 
 - Pre-allocate working memory during initialization.
 - Use arenas for transient allocations.
 - Reset arenas after each operation.
 - Monitor actual usage against expected phases.
 
-5.6.4. **Build systems that tolerate linear-memory high-water marks.** Accept that the high-water mark will persist and design for it. Rather than trying to minimize the high-water mark (which is often impractical), ensure that:
+7.6.4. **Build systems that tolerate linear-memory high-water marks.** Accept that the high-water mark will persist and design for it. Rather than trying to minimize the high-water mark (which is often impractical), ensure that:
 
 - The high-water mark is bounded (not growing monotonically over the session).
 - The application functions correctly at the high-water mark (no assumption that free memory is available).
 - The user experience degrades gracefully (not catastrophically) as the high-water mark approaches the maximum memory limit.
 
-5.6.5. **Consider module instance recycling.** For applications where the high-water mark inevitably grows over long sessions (e.g., design tools where users create and delete many objects), implement a module recycling strategy:
+7.6.5. **Consider module instance recycling.** For applications where the high-water mark inevitably grows over long sessions (e.g., design tools where users create and delete many objects), implement a module recycling strategy:
 
 - Periodically serialize essential state.
 - Destroy the current Wasm instance.
@@ -378,19 +510,21 @@ This is the Wasm equivalent of restarting a process to reclaim fragmented memory
 
 ---
 
-## 6. Conclusion
+## 8. Conclusion
 
-### 6.1 Summary
+### 8.1 Summary
 
-6.1.1. Rust compiled to WebAssembly represents a significant advance in the security and performance of browser-based applications. Rust's ownership model eliminates entire classes of memory vulnerabilities at the language level. The Wasm sandbox provides isolation guarantees that no JavaScript framework can match. Together, they enable a class of browser application—large, stateful, performance-critical, security-sensitive—that was previously the exclusive domain of native desktop software.
+8.1.1. Rust compiled to WebAssembly represents a significant advance in the security and performance of browser-based applications. Rust's ownership model eliminates entire classes of memory vulnerabilities at the language level. The Wasm sandbox provides isolation guarantees that no JavaScript framework can match. Together, they enable a class of browser application—large, stateful, performance-critical, security-sensitive—that was previously the exclusive domain of native desktop software.
 
-6.1.2. However, the Wasm memory model introduces unique engineering constraints that have no direct equivalent in JavaScript or native development. The grow-only linear memory model, the interaction between the Rust heap allocator and Wasm pages, the `ArrayBuffer` detachment semantics, and the dual-heap architecture of JS/Wasm applications create a taxonomy of risks that demands careful architectural attention.
+8.1.2. However, the Wasm memory model introduces unique engineering constraints that have no direct equivalent in JavaScript or native development. The grow-only linear memory model, the interaction between the Rust heap allocator and Wasm pages, the `ArrayBuffer` detachment semantics, and the dual-heap architecture of JS/Wasm applications create a taxonomy of risks that demands careful architectural attention.
 
-6.1.3. These constraints are manageable. The industry evidence demonstrates that companies including Google, Figma, Adobe, Autodesk, Cloudflare, and Shopify have successfully deployed large-scale Wasm applications by applying the mitigation strategies described in this paper: arena allocation, scratch buffers, streaming processing, memory budgeting, lifecycle management, and module recycling.
+8.1.3. For applications that render UI via WebGL or WebGPU, the memory picture extends beyond Wasm linear memory to include GPU-side allocations—texture atlases, vertex buffers, and shader programs—that are invisible to standard Wasm memory monitoring and compete for physical RAM on unified-memory mobile devices (§5). The choice between immediate-mode and retained-mode rendering architectures further shapes the memory profile: immediate-mode designs naturally align with arena allocation and produce predictable, bounded memory usage, while retained-mode designs require more defensive engineering to avoid fragmentation and widget lifecycle leaks in a grow-only memory model (§6).
 
-### 6.2 Future Directions
+8.1.4. These constraints are manageable. The industry evidence demonstrates that companies including Google, Figma, Adobe, Autodesk, Cloudflare, and Shopify have successfully deployed large-scale Wasm applications by applying the mitigation strategies described in this paper: arena allocation, scratch buffers, streaming processing, memory budgeting, lifecycle management, module recycling, and rendering-architecture-aware GPU memory management.
 
-6.2.1. Several in-progress WebAssembly proposals will address the constraints discussed in this paper:
+### 8.2 Future Directions
+
+8.2.1. Several in-progress WebAssembly proposals will address the constraints discussed in this paper:
 
 - **Memory64.** The memory64 proposal extends Wasm linear memory addresses from 32 bits to 64 bits, raising the maximum addressable memory from 4 GB to the platform's virtual address space limit. While this does not solve the grow-only constraint, it removes the 4 GB ceiling that currently limits the largest Wasm applications.
 - **GC proposal.** The Wasm GC proposal introduces garbage-collected reference types (structs, arrays) that live on the host GC heap rather than in linear memory. For languages that target Wasm GC (Kotlin, Dart, Java, OCaml), this eliminates the linear memory model entirely for managed objects. For Rust, the GC proposal is less directly applicable, but it enables better interop with GC'd host languages.
@@ -398,9 +532,9 @@ This is the Wasm equivalent of restarting a process to reclaim fragmented memory
 - **Threads and shared memory.** The threads proposal (partially shipped) enables shared linear memory between Wasm instances running in separate Web Workers. This introduces shared-memory concurrency (and its attendant risks), but also enables more efficient architectures where multiple workers share a single linear memory rather than maintaining separate copies.
 - **Memory control.** There have been informal discussions (though no formal proposal at the time of writing) about providing finer-grained memory control, including the ability to decommit pages within linear memory without shrinking the address space. This would allow allocators to return physical pages to the OS while preserving address-space layout—analogous to `madvise(MADV_DONTNEED)` on Linux.
 
-6.2.2. Browser engines continue to improve their Wasm implementations. V8's TurboFan and Liftoff compilers, SpiderMonkey's Cranelift-based backend, and JavaScriptCore's BBQ and OMG tiers all produce increasingly efficient code. Browser memory management is also improving: Chrome's `PartitionAlloc` and V8's pointer compression reduce the overhead of the JavaScript side of dual-heap architectures.
+8.2.2. Browser engines continue to improve their Wasm implementations. V8's TurboFan and Liftoff compilers, SpiderMonkey's Cranelift-based backend, and JavaScriptCore's BBQ and OMG tiers all produce increasingly efficient code. Browser memory management is also improving: Chrome's `PartitionAlloc` and V8's pointer compression reduce the overhead of the JavaScript side of dual-heap architectures.
 
-6.2.3. The trajectory is clear: WebAssembly is becoming a first-class compilation target for systems software in the browser, and the tooling, specifications, and runtime implementations are converging to support the needs of large-scale production deployments. The memory constraints discussed in this paper are real and consequential, but they are engineering constraints—tractable, measurable, and addressable through the architectural discipline that systems engineers already practice. The Rust→Wasm platform does not eliminate the need for careful memory engineering; it provides a foundation on which careful memory engineering can be applied with confidence that the language and runtime will not silently undermine it.
+8.2.3. The trajectory is clear: WebAssembly is becoming a first-class compilation target for systems software in the browser, and the tooling, specifications, and runtime implementations are converging to support the needs of large-scale production deployments. The memory constraints discussed in this paper are real and consequential, but they are engineering constraints—tractable, measurable, and addressable through the architectural discipline that systems engineers already practice. The Rust→Wasm platform does not eliminate the need for careful memory engineering; it provides a foundation on which careful memory engineering can be applied with confidence that the language and runtime will not silently undermine it.
 
 ---
 
