@@ -95,11 +95,101 @@ pub struct FieldSchema {
     pub label: String,
     pub field_type: FieldType,
     pub rules: Vec<ValidationRule>,
+    pub placeholder: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FormSchema {
+    pub name: String,
     pub fields: Vec<FieldSchema>,
+}
+
+impl FormSchema {
+    /// Create a new empty form schema with the given name.
+    pub fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            fields: Vec::new(),
+        }
+    }
+
+    /// Add a field with the given name and type, using default settings.
+    pub fn field(mut self, name: &str, field_type: FieldType) -> Self {
+        self.fields.push(FieldSchema {
+            id: name.to_string(),
+            label: name.to_string(),
+            field_type,
+            rules: Vec::new(),
+            placeholder: None,
+        });
+        self
+    }
+
+    /// Mark the named field as required by adding `ValidationRule::Required`.
+    pub fn required(mut self, name: &str) -> Self {
+        if let Some(field) = self.fields.iter_mut().find(|f| f.id == name) {
+            if !field.rules.iter().any(|r| matches!(r, ValidationRule::Required)) {
+                field.rules.push(ValidationRule::Required);
+            }
+        }
+        self
+    }
+
+    /// Set the display label for the named field.
+    pub fn with_label(mut self, name: &str, label: &str) -> Self {
+        if let Some(field) = self.fields.iter_mut().find(|f| f.id == name) {
+            field.label = label.to_string();
+        }
+        self
+    }
+
+    /// Set the placeholder text for the named field.
+    pub fn with_placeholder(mut self, name: &str, placeholder: &str) -> Self {
+        if let Some(field) = self.fields.iter_mut().find(|f| f.id == name) {
+            field.placeholder = Some(placeholder.to_string());
+        }
+        self
+    }
+
+    /// Add a validation rule to the named field.
+    pub fn with_validation(mut self, name: &str, rule: ValidationRule) -> Self {
+        if let Some(field) = self.fields.iter_mut().find(|f| f.id == name) {
+            field.rules.push(rule);
+        }
+        self
+    }
+
+    /// Add a nested field group built by the provided closure.
+    pub fn group(mut self, name: &str, builder: impl FnOnce(FormSchema) -> FormSchema) -> Self {
+        let inner = builder(FormSchema::new(name));
+        self.fields.push(FieldSchema {
+            id: name.to_string(),
+            label: name.to_string(),
+            field_type: FieldType::Group {
+                fields: inner.fields,
+                repeatable: false,
+            },
+            rules: Vec::new(),
+            placeholder: None,
+        });
+        self
+    }
+
+    /// Add a repeatable (list) field group built by the provided closure.
+    pub fn repeatable_group(mut self, name: &str, builder: impl FnOnce(FormSchema) -> FormSchema) -> Self {
+        let inner = builder(FormSchema::new(name));
+        self.fields.push(FieldSchema {
+            id: name.to_string(),
+            label: name.to_string(),
+            field_type: FieldType::Group {
+                fields: inner.fields,
+                repeatable: true,
+            },
+            rules: Vec::new(),
+            placeholder: None,
+        });
+        self
+    }
 }
 
 /// Holds the current state of all form fields, keyed by path.
@@ -555,11 +645,13 @@ mod tests {
             label: id.to_string(),
             field_type: FieldType::Text,
             rules: vec![],
+            placeholder: None,
         }
     }
 
     fn simple_schema() -> FormSchema {
         FormSchema {
+            name: "test".to_string(),
             fields: vec![text_field("name"), text_field("email")],
         }
     }
@@ -631,11 +723,13 @@ mod tests {
     #[test]
     fn submission_rollback_restores_snapshot() {
         let schema = FormSchema {
+            name: "test".to_string(),
             fields: vec![FieldSchema {
                 id: "name".into(),
                 label: "Name".into(),
                 field_type: FieldType::Text,
                 rules: vec![ValidationRule::Required],
+                placeholder: None,
             }],
         };
         let mut form = Form::new(schema);
@@ -780,11 +874,13 @@ mod tests {
     #[test]
     fn validation_required_empty_text_fails() {
         let schema = FormSchema {
+            name: "test".to_string(),
             fields: vec![FieldSchema {
                 id: "name".into(),
                 label: "Name".into(),
                 field_type: FieldType::Text,
                 rules: vec![ValidationRule::Required],
+                placeholder: None,
             }],
         };
         let mut form = Form::new(schema);
@@ -795,11 +891,13 @@ mod tests {
     #[test]
     fn validation_required_nonempty_text_passes() {
         let schema = FormSchema {
+            name: "test".to_string(),
             fields: vec![FieldSchema {
                 id: "name".into(),
                 label: "Name".into(),
                 field_type: FieldType::Text,
                 rules: vec![ValidationRule::Required],
+                placeholder: None,
             }],
         };
         let mut form = Form::new(schema);
@@ -812,11 +910,13 @@ mod tests {
     #[test]
     fn validation_errors_stored_on_field() {
         let schema = FormSchema {
+            name: "test".to_string(),
             fields: vec![FieldSchema {
                 id: "name".into(),
                 label: "Name".into(),
                 field_type: FieldType::Text,
                 rules: vec![ValidationRule::Required],
+                placeholder: None,
             }],
         };
         let mut form = Form::new(schema);
@@ -857,11 +957,13 @@ mod tests {
     #[test]
     fn start_submit_fails_validation() {
         let schema = FormSchema {
+            name: "test".to_string(),
             fields: vec![FieldSchema {
                 id: "name".into(),
                 label: "Name".into(),
                 field_type: FieldType::Text,
                 rules: vec![ValidationRule::Required],
+                placeholder: None,
             }],
         };
         let mut form = Form::new(schema);
@@ -941,24 +1043,28 @@ mod tests {
     #[test]
     fn new_form_creates_default_fields() {
         let schema = FormSchema {
+            name: "test".to_string(),
             fields: vec![
                 FieldSchema {
                     id: "name".into(),
                     label: "Name".into(),
                     field_type: FieldType::Text,
                     rules: vec![],
+                    placeholder: None,
                 },
                 FieldSchema {
                     id: "age".into(),
                     label: "Age".into(),
                     field_type: FieldType::Number,
                     rules: vec![],
+                    placeholder: None,
                 },
                 FieldSchema {
                     id: "agree".into(),
                     label: "Agree".into(),
                     field_type: FieldType::Checkbox,
                     rules: vec![],
+                    placeholder: None,
                 },
             ],
         };
@@ -1016,5 +1122,182 @@ mod tests {
             FieldValue::Text(v) => assert_eq!(v, "second"),
             _ => panic!("expected Text"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Builder API
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn builder_produces_correct_schema() {
+        let schema = FormSchema::new("login")
+            .field("email", FieldType::Text)
+            .field("password", FieldType::Text);
+
+        assert_eq!(schema.name, "login");
+        assert_eq!(schema.fields.len(), 2);
+        assert_eq!(schema.fields[0].id, "email");
+        assert_eq!(schema.fields[1].id, "password");
+    }
+
+    #[test]
+    fn builder_required_adds_validation_rule() {
+        let schema = FormSchema::new("test")
+            .field("email", FieldType::Text)
+            .required("email");
+
+        assert_eq!(schema.fields[0].rules.len(), 1);
+        assert!(matches!(schema.fields[0].rules[0], ValidationRule::Required));
+    }
+
+    #[test]
+    fn builder_required_is_idempotent() {
+        let schema = FormSchema::new("test")
+            .field("email", FieldType::Text)
+            .required("email")
+            .required("email");
+
+        assert_eq!(schema.fields[0].rules.len(), 1);
+    }
+
+    #[test]
+    fn builder_required_fields_are_validated() {
+        let schema = FormSchema::new("test")
+            .field("email", FieldType::Text)
+            .required("email");
+
+        let mut form = Form::new(schema);
+        let result = form.validate();
+        assert!(result.is_err());
+
+        let path = FormPath::root().push("email");
+        form.set_value(&path, FieldValue::Text("test@example.com".into()));
+        let result = form.validate();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn builder_with_label_sets_label() {
+        let schema = FormSchema::new("test")
+            .field("email", FieldType::Text)
+            .with_label("email", "Email Address");
+
+        assert_eq!(schema.fields[0].label, "Email Address");
+    }
+
+    #[test]
+    fn builder_with_placeholder_sets_placeholder() {
+        let schema = FormSchema::new("test")
+            .field("email", FieldType::Text)
+            .with_placeholder("email", "you@example.com");
+
+        assert_eq!(
+            schema.fields[0].placeholder.as_deref(),
+            Some("you@example.com")
+        );
+    }
+
+    #[test]
+    fn builder_with_validation_adds_rule() {
+        let schema = FormSchema::new("test")
+            .field("email", FieldType::Text)
+            .with_validation("email", ValidationRule::Required)
+            .with_validation("email", ValidationRule::Email);
+
+        assert_eq!(schema.fields[0].rules.len(), 2);
+        assert!(matches!(schema.fields[0].rules[0], ValidationRule::Required));
+        assert!(matches!(schema.fields[0].rules[1], ValidationRule::Email));
+    }
+
+    #[test]
+    fn builder_multiple_validation_rules_on_one_field() {
+        let schema = FormSchema::new("test")
+            .field("username", FieldType::Text)
+            .required("username")
+            .with_validation(
+                "username",
+                ValidationRule::Regex {
+                    pattern: "^[a-z]+$".into(),
+                },
+            );
+
+        assert_eq!(schema.fields[0].rules.len(), 2);
+    }
+
+    #[test]
+    fn builder_nested_group() {
+        let schema = FormSchema::new("test")
+            .group("profile", |s| {
+                s.field("name", FieldType::Text)
+                    .required("name")
+                    .field("email", FieldType::Text)
+            });
+
+        assert_eq!(schema.fields.len(), 1);
+        assert_eq!(schema.fields[0].id, "profile");
+        match &schema.fields[0].field_type {
+            FieldType::Group { fields, repeatable } => {
+                assert!(!repeatable);
+                assert_eq!(fields.len(), 2);
+                assert_eq!(fields[0].id, "name");
+                assert!(matches!(fields[0].rules[0], ValidationRule::Required));
+                assert_eq!(fields[1].id, "email");
+            }
+            _ => panic!("expected Group"),
+        }
+    }
+
+    #[test]
+    fn builder_repeatable_group() {
+        let schema = FormSchema::new("test")
+            .repeatable_group("contacts", |s| {
+                s.field("label", FieldType::Text)
+                    .required("label")
+                    .field("value", FieldType::Text)
+            });
+
+        assert_eq!(schema.fields.len(), 1);
+        match &schema.fields[0].field_type {
+            FieldType::Group { fields, repeatable } => {
+                assert!(repeatable);
+                assert_eq!(fields.len(), 2);
+            }
+            _ => panic!("expected Group"),
+        }
+    }
+
+    #[test]
+    fn builder_default_label_matches_id() {
+        let schema = FormSchema::new("test")
+            .field("username", FieldType::Text);
+
+        assert_eq!(schema.fields[0].label, "username");
+    }
+
+    #[test]
+    fn builder_default_placeholder_is_none() {
+        let schema = FormSchema::new("test")
+            .field("username", FieldType::Text);
+
+        assert!(schema.fields[0].placeholder.is_none());
+    }
+
+    #[test]
+    fn builder_form_roundtrip() {
+        let schema = FormSchema::new("login")
+            .field("email", FieldType::Text)
+            .required("email")
+            .with_placeholder("email", "you@example.com")
+            .field("password", FieldType::Text)
+            .required("password");
+
+        let form = Form::new(schema);
+        assert_eq!(form.schema().fields.len(), 2);
+        assert_eq!(form.schema().name, "login");
+
+        let email_path = FormPath::root().push("email");
+        let pwd_path = FormPath::root().push("password");
+        assert!(form.state().get_field(&email_path).is_some());
+        assert!(form.state().get_field(&pwd_path).is_some());
     }
 }
