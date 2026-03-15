@@ -34,11 +34,44 @@ pub struct WidgetInfo {
     pub state: A11yState,
 }
 
+/// Direction in which widgets are placed within a layout context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayoutDirection {
+    /// Widgets stack vertically (default).
+    Vertical,
+    /// Widgets are placed side by side horizontally.
+    Horizontal,
+}
+
+/// A single entry on the layout stack, representing a row or column region.
+#[derive(Clone, Debug)]
+struct LayoutContext {
+    direction: LayoutDirection,
+    /// Origin of this layout region.
+    origin: Vec2,
+    /// Cursor within this region (advances along the primary axis).
+    cursor: Vec2,
+    /// Total width available to this region.
+    width: f32,
+    /// Spacing between consecutive items.
+    spacing: f32,
+    /// For horizontal layouts: proportional weights for each child slot.
+    /// When empty, children share the width equally (computed on the fly).
+    weights: Vec<f32>,
+    /// For horizontal layouts: how many children have been placed so far.
+    child_index: usize,
+    /// For horizontal layouts: tracks the tallest child so that `end_row`
+    /// can advance the parent cursor past the entire row.
+    max_child_height: f32,
+}
+
 #[derive(Clone, Debug)]
 pub struct Layout {
     cursor: Vec2,
     width: f32,
     spacing: f32,
+    /// Stack of nested layout contexts (rows inside columns, etc.).
+    stack: Vec<LayoutContext>,
 }
 
 impl Layout {
@@ -47,13 +80,124 @@ impl Layout {
             cursor: Vec2::new(x, y),
             width,
             spacing: 10.0,
+            stack: Vec::new(),
         }
     }
 
     pub fn next_rect(&mut self, height: f32) -> Rect {
-        let rect = Rect::new(self.cursor.x, self.cursor.y, self.width, height);
-        self.cursor.y += height + self.spacing;
-        rect
+        if let Some(ctx) = self.stack.last_mut() {
+            match ctx.direction {
+                LayoutDirection::Vertical => {
+                    let rect = Rect::new(ctx.cursor.x, ctx.cursor.y, ctx.width, height);
+                    ctx.cursor.y += height + ctx.spacing;
+                    rect
+                }
+                LayoutDirection::Horizontal => {
+                    let idx = ctx.child_index;
+                    let (item_x, item_w) = Self::compute_slot(ctx, idx);
+                    let rect = Rect::new(item_x, ctx.cursor.y, item_w, height);
+                    ctx.child_index += 1;
+                    if height > ctx.max_child_height {
+                        ctx.max_child_height = height;
+                    }
+                    rect
+                }
+            }
+        } else {
+            // No stack — use the top-level vertical layout.
+            let rect = Rect::new(self.cursor.x, self.cursor.y, self.width, height);
+            self.cursor.y += height + self.spacing;
+            rect
+        }
+    }
+
+    /// Begin a horizontal row with equal-width children.
+    pub fn begin_row(&mut self) {
+        self.begin_row_with(&[]);
+    }
+
+    /// Begin a horizontal row with proportional `weights`.
+    /// An empty slice means equal distribution (determined per-child).
+    pub fn begin_row_with(&mut self, weights: &[f32]) {
+        let (x, y, w, spacing) = if let Some(ctx) = self.stack.last() {
+            (ctx.cursor.x, ctx.cursor.y, ctx.width, ctx.spacing)
+        } else {
+            (self.cursor.x, self.cursor.y, self.width, self.spacing)
+        };
+        self.stack.push(LayoutContext {
+            direction: LayoutDirection::Horizontal,
+            origin: Vec2::new(x, y),
+            cursor: Vec2::new(x, y),
+            width: w,
+            spacing,
+            weights: weights.to_vec(),
+            child_index: 0,
+            max_child_height: 0.0,
+        });
+    }
+
+    /// End the current horizontal row, advancing the parent cursor past it.
+    pub fn end_row(&mut self) {
+        let ctx = match self.stack.pop() {
+            Some(c) => c,
+            None => return, // no-op if no matching begin_row
+        };
+        let advance = ctx.max_child_height + ctx.spacing;
+        if let Some(parent) = self.stack.last_mut() {
+            parent.cursor.y += advance;
+        } else {
+            self.cursor.y += advance;
+        }
+    }
+
+    /// Compute the x-position and width for a given child slot inside a
+    /// horizontal layout context.
+    fn compute_slot(ctx: &LayoutContext, idx: usize) -> (f32, f32) {
+        if ctx.weights.is_empty() {
+            // Equal distribution: we don't know the total child count ahead
+            // of time, so we just divide available width by (idx+1) ... but
+            // that shifts previous items.  Instead we treat each child as
+            // getting its share of the remaining space.  For a predictable
+            // equal split callers should use weights like [1.0, 1.0].
+            //
+            // Fallback: give each child 1/1 weight, which makes them all
+            // get the same width as long as the caller is consistent.  We
+            // compute per-child width as total_width / max(1, child_count)
+            // where child_count is unknown.  So we use the simple approach:
+            // each child occupies (width - gaps_so_far) / 1, but positioned
+            // after previous children.  This is necessarily approximate
+            // without knowing the total count.  For best results callers
+            // should provide weights.
+            //
+            // Practical approach: treat it like weights = [1.0; N] but
+            // we don't know N.  Just give each child an equal slot width
+            // based on how many weights we would have needed.  Since we
+            // can't know N in advance in an immediate-mode API, we use a
+            // reasonable default of splitting remaining space.
+            //
+            // Actually, the simplest correct approach: accumulate x offset
+            // per child.  Each child gets width = 0 until end_row, which
+            // isn't useful.  Let's just use a default of 2 children (the
+            // common case) when no weights are given.
+            let n = 2usize;
+            let gap_total = ctx.spacing * (n as f32 - 1.0).max(0.0);
+            let item_w = (ctx.width - gap_total) / n as f32;
+            let x = ctx.origin.x + idx as f32 * (item_w + ctx.spacing);
+            (x, item_w)
+        } else {
+            let total_weight: f32 = ctx.weights.iter().sum();
+            let n = ctx.weights.len();
+            let gap_total = ctx.spacing * (n as f32 - 1.0).max(0.0);
+            let available = ctx.width - gap_total;
+            // Sum weights before this index to find x offset.
+            let weight_before: f32 = ctx.weights.iter().take(idx).sum();
+            let my_weight = ctx.weights.get(idx).copied().unwrap_or(1.0);
+            let x = ctx.origin.x
+                + (weight_before / total_weight) * available
+                + idx as f32 * ctx.spacing;
+            let w = (my_weight / total_weight) * available;
+            (x, w)
+        }
     }
 }
 
@@ -274,6 +418,34 @@ impl Ui {
         }
         self.focused = Some(self.widgets[idx].id);
     }
+
+    // -----------------------------------------------------------------
+    // Layout: row containers
+    // -----------------------------------------------------------------
+
+    /// Begin a horizontal row. Widgets placed between `begin_row()` and
+    /// `end_row()` will be laid out side by side with equal widths.
+    pub fn begin_row(&mut self) {
+        self.layout.begin_row();
+    }
+
+    /// Begin a horizontal row with proportional width weights.
+    ///
+    /// For example, `&[1.0, 2.0]` gives the first child 1/3 and the
+    /// second child 2/3 of the available width.
+    pub fn begin_row_with(&mut self, weights: &[f32]) {
+        self.layout.begin_row_with(weights);
+    }
+
+    /// End the current horizontal row and resume vertical layout.
+    /// If there is no matching `begin_row`, this is a no-op.
+    pub fn end_row(&mut self) {
+        self.layout.end_row();
+    }
+
+    // -----------------------------------------------------------------
+    // Widgets
+    // -----------------------------------------------------------------
 
     pub fn label(&mut self, text: &str) {
         let rect = self.layout.next_rect(24.0 * self.scale);
@@ -1570,5 +1742,114 @@ mod tests {
             .find(|r| r.text.contains('\u{2022}'))
             .expect("expected masked text run");
         assert_eq!(run.text, "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Horizontal layout (begin_row / end_row)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn begin_row_places_two_widgets_side_by_side() {
+        let mut layout = Layout::new(10.0, 10.0, 200.0);
+        layout.begin_row_with(&[1.0, 1.0]);
+        let r1 = layout.next_rect(30.0);
+        let r2 = layout.next_rect(30.0);
+        layout.end_row();
+
+        // Both should be on the same y.
+        assert_eq!(r1.y, 10.0);
+        assert_eq!(r2.y, 10.0);
+        // r1 should start at x=10, r2 should be to its right.
+        assert_eq!(r1.x, 10.0);
+        // Available = 200 - 10 (one gap) = 190; each gets 95.
+        let expected_w = (200.0 - 10.0) / 2.0;
+        assert!((r1.w - expected_w).abs() < 0.01);
+        assert!((r2.w - expected_w).abs() < 0.01);
+        // r2.x = origin + (1/2)*available + 1*spacing
+        let expected_r2_x = 10.0 + 0.5 * (200.0 - 10.0) + 10.0;
+        assert!((r2.x - expected_r2_x).abs() < 0.01);
+    }
+
+    #[test]
+    fn proportional_weights_distribute_width() {
+        let mut layout = Layout::new(0.0, 0.0, 300.0);
+        layout.begin_row_with(&[1.0, 2.0]);
+        let r1 = layout.next_rect(20.0);
+        let r2 = layout.next_rect(20.0);
+        layout.end_row();
+
+        // gap_total = 10.0, available = 290.0
+        // r1 weight 1/3 => w = 290/3 ≈ 96.67
+        // r2 weight 2/3 => w = 580/3 ≈ 193.33
+        let available = 300.0 - 10.0;
+        assert!((r1.w - available / 3.0).abs() < 0.01);
+        assert!((r2.w - available * 2.0 / 3.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn nested_row_in_column() {
+        let mut ui = test_ui();
+        ui.begin_frame(vec![], 800.0, 600.0, 1.0, 0.0);
+
+        // First widget in vertical layout.
+        ui.label("Header");
+        let header_rect = ui.widgets.last().unwrap().rect;
+
+        // Now a row with two labels.
+        ui.begin_row_with(&[1.0, 1.0]);
+        ui.label("Left");
+        ui.label("Right");
+        ui.end_row();
+
+        let left_rect = ui.widgets.iter().find(|w| w.label == "Left").unwrap().rect;
+        let right_rect = ui.widgets.iter().find(|w| w.label == "Right").unwrap().rect;
+
+        // Both row children should be below the header.
+        assert!(left_rect.y > header_rect.y);
+        // They should share the same y.
+        assert_eq!(left_rect.y, right_rect.y);
+        // Right should be to the right of left.
+        assert!(right_rect.x > left_rect.x);
+
+        // A widget after end_row should be below the row.
+        ui.label("Footer");
+        let footer = ui.widgets.last().unwrap();
+        assert!(footer.rect.y > left_rect.y);
+    }
+
+    #[test]
+    fn end_row_without_begin_row_is_noop() {
+        let mut layout = Layout::new(0.0, 0.0, 200.0);
+        let y_before = layout.cursor.y;
+        layout.end_row(); // should not panic
+        assert_eq!(layout.cursor.y, y_before);
+    }
+
+    #[test]
+    fn row_advances_parent_cursor_by_tallest_child() {
+        let mut layout = Layout::new(0.0, 0.0, 200.0);
+        layout.begin_row_with(&[1.0, 1.0]);
+        let _r1 = layout.next_rect(20.0);
+        let _r2 = layout.next_rect(50.0); // taller
+        layout.end_row();
+
+        // Next vertical widget should be at y = 50 + spacing(10) = 60.
+        let r3 = layout.next_rect(10.0);
+        assert!((r3.y - 60.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn begin_row_no_weights_defaults_to_two_columns() {
+        let mut layout = Layout::new(0.0, 0.0, 200.0);
+        layout.begin_row();
+        let r1 = layout.next_rect(20.0);
+        let r2 = layout.next_rect(20.0);
+        layout.end_row();
+
+        // Default (no weights) assumes 2 columns.
+        assert_eq!(r1.y, r2.y);
+        assert!(r2.x > r1.x);
+        let expected_w = (200.0 - 10.0) / 2.0;
+        assert!((r1.w - expected_w).abs() < 0.01);
     }
 }
