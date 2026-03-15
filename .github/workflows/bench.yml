@@ -64,6 +64,7 @@ jobs:
           alert-threshold: '110%'
           fail-on-alert: ${{ github.event_name == 'pull_request' }}
           save-data-file: ${{ github.ref == 'refs/heads/main' }}
+          skip-fetch-gh-pages: ${{ github.event_name == 'pull_request' }}
 
   wasm-size:
     name: Check WASM binary size
