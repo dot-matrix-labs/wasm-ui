@@ -1,8 +1,10 @@
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 use crate::accessibility::{A11yNode, A11yRole, A11yState, A11yTree};
 use crate::batch::{Batch, Material, Quad, TextRun};
+use crate::form::{FieldValue, Form, FormPath};
 use crate::hit_test::{HitTestEntry, HitTestGrid};
 use crate::input::{InputEvent, KeyCode, PointerButton};
 use crate::text::TextBuffer;
@@ -78,13 +80,17 @@ pub struct Ui {
     /// Widget id that received the last click, used to reset count on target change.
     last_click_id: Option<u64>,
     /// Scroll offsets per widget id (horizontal pixel offset into the text).
-    _scroll_offsets: std::collections::HashMap<u64, f32>,
+    _scroll_offsets: HashMap<u64, f32>,
     /// Whether the focused text input is in overwrite (insert-key toggle) mode.
     overwrite_mode: bool,
     /// ID stack used to disambiguate widgets with identical labels.
     /// Values are pushed/popped by the caller (e.g. loop index) and mixed
     /// into every `hash_id` call so that repeated labels produce unique IDs.
     id_stack: Vec<u64>,
+    /// Auto-managed `TextBuffer`s keyed by `FormPath`, used by
+    /// `text_input_for` / `text_input_masked_for` to eliminate manual
+    /// buffer management.
+    form_buffers: HashMap<FormPath, TextBuffer>,
 }
 
 impl Ui {
@@ -107,9 +113,10 @@ impl Ui {
             click_count: 0,
             last_click_time: 0.0,
             last_click_id: None,
-            _scroll_offsets: std::collections::HashMap::new(),
+            _scroll_offsets: HashMap::new(),
             overwrite_mode: false,
             id_stack: Vec::new(),
+            form_buffers: HashMap::new(),
         }
     }
 
@@ -544,6 +551,75 @@ impl Ui {
         height: f32,
     ) -> bool {
         self.text_input_impl(label, buffer, placeholder, true, false, height)
+    }
+
+    /// Auto-binding text input: creates/reuses an internal `TextBuffer`
+    /// keyed by `path`, initializes it from the form state if new, runs
+    /// the standard `text_input` logic, and syncs changes back to the form.
+    ///
+    /// Returns `true` if the field was clicked (gained focus).
+    pub fn text_input_for(
+        &mut self,
+        form: &mut Form,
+        path: &FormPath,
+        label: &str,
+        placeholder: &str,
+    ) -> bool {
+        self.text_input_for_impl(form, path, label, placeholder, false)
+    }
+
+    /// Masked variant of [`text_input_for`](Self::text_input_for) (password
+    /// fields).
+    pub fn text_input_masked_for(
+        &mut self,
+        form: &mut Form,
+        path: &FormPath,
+        label: &str,
+        placeholder: &str,
+    ) -> bool {
+        self.text_input_for_impl(form, path, label, placeholder, true)
+    }
+
+    /// Shared implementation for `text_input_for` / `text_input_masked_for`.
+    fn text_input_for_impl(
+        &mut self,
+        form: &mut Form,
+        path: &FormPath,
+        label: &str,
+        placeholder: &str,
+        masked: bool,
+    ) -> bool {
+        // Ensure a buffer exists for this path, initialized from form state.
+        if !self.form_buffers.contains_key(path) {
+            let initial = form
+                .state()
+                .get_field(path)
+                .and_then(|fs| match &fs.value {
+                    FieldValue::Text(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            self.form_buffers.insert(path.clone(), TextBuffer::new(initial));
+        }
+
+        // Temporarily remove the buffer so we can pass `&mut self` and
+        // `&mut buffer` independently to `text_input_impl`.
+        let mut buf = self.form_buffers.remove(path).unwrap();
+        let before = buf.text().to_string();
+
+        let scale = self.scale;
+        let clicked = self.text_input_impl(label, &mut buf, placeholder, false, masked, 40.0 * scale);
+
+        let after = buf.text().to_string();
+
+        // Put the buffer back.
+        self.form_buffers.insert(path.clone(), buf);
+
+        if after != before {
+            form.set_value(path, FieldValue::Text(after));
+        }
+
+        clicked
     }
 
     fn text_input_impl(
@@ -1383,5 +1459,132 @@ mod tests {
         assert!(ui.widgets.is_empty());
         assert!(ui.batch.text_runs.is_empty());
         assert!(ui.batch.vertices.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Form-bound text input (text_input_for / text_input_masked_for)
+    // -----------------------------------------------------------------------
+
+    use crate::form::{FieldSchema, FieldType, FormSchema};
+
+    fn simple_form_schema() -> FormSchema {
+        FormSchema {
+            fields: vec![
+                FieldSchema {
+                    id: "name".into(),
+                    label: "Name".into(),
+                    field_type: FieldType::Text,
+                    rules: vec![],
+                },
+                FieldSchema {
+                    id: "email".into(),
+                    label: "Email".into(),
+                    field_type: FieldType::Text,
+                    rules: vec![],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn text_input_for_creates_buffer_from_form_state() {
+        let mut ui = test_ui();
+        let mut form = Form::new(simple_form_schema());
+        let path = FormPath::root().push("name");
+
+        // Pre-set a value on the form before first render.
+        form.set_value(&path, FieldValue::Text("Alice".into()));
+
+        ui.begin_frame(vec![], 800.0, 600.0, 1.0, 0.0);
+        ui.text_input_for(&mut form, &path, "Name", "");
+
+        // The auto-created buffer should have been initialized from the form.
+        let buf = ui.form_buffers.get(&path).unwrap();
+        assert_eq!(buf.text(), "Alice");
+    }
+
+    #[test]
+    fn text_input_for_syncs_edits_back_to_form() {
+        let mut ui = test_ui();
+        let mut form = Form::new(simple_form_schema());
+        let path = FormPath::root().push("name");
+
+        // First frame: create the buffer (initially empty).
+        ui.begin_frame(vec![], 800.0, 600.0, 1.0, 0.0);
+        ui.text_input_for(&mut form, &path, "Name", "");
+
+        // Focus the widget so it processes text events.
+        let widget_id = ui.hash_id("Name");
+        ui.focused = Some(widget_id);
+
+        // Second frame: simulate typing "Bob" via a TextInput event.
+        let events = vec![InputEvent::TextInput(crate::input::TextInputEvent {
+            text: "Bob".into(),
+        })];
+        ui.begin_frame(events, 800.0, 600.0, 1.0, 0.0);
+        // Re-focus after begin_frame (focus persists but let's be explicit).
+        ui.focused = Some(widget_id);
+        ui.text_input_for(&mut form, &path, "Name", "");
+
+        // The form state should reflect the typed value.
+        let field = form.state().get_field(&path).unwrap();
+        match &field.value {
+            FieldValue::Text(v) => assert_eq!(v, "Bob"),
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn text_input_for_multiple_fields_separate_buffers() {
+        let mut ui = test_ui();
+        let mut form = Form::new(simple_form_schema());
+        let name_path = FormPath::root().push("name");
+        let email_path = FormPath::root().push("email");
+
+        form.set_value(&name_path, FieldValue::Text("Alice".into()));
+        form.set_value(&email_path, FieldValue::Text("alice@example.com".into()));
+
+        ui.begin_frame(vec![], 800.0, 600.0, 1.0, 0.0);
+        ui.text_input_for(&mut form, &name_path, "Name", "");
+        ui.text_input_for(&mut form, &email_path, "Email", "");
+
+        assert_eq!(ui.form_buffers.get(&name_path).unwrap().text(), "Alice");
+        assert_eq!(
+            ui.form_buffers.get(&email_path).unwrap().text(),
+            "alice@example.com"
+        );
+    }
+
+    #[test]
+    fn text_input_masked_for_works() {
+        let mut ui = test_ui();
+        let schema = FormSchema {
+            fields: vec![FieldSchema {
+                id: "password".into(),
+                label: "Password".into(),
+                field_type: FieldType::Text,
+                rules: vec![],
+            }],
+        };
+        let mut form = Form::new(schema);
+        let path = FormPath::root().push("password");
+
+        form.set_value(&path, FieldValue::Text("secret".into()));
+
+        ui.begin_frame(vec![], 800.0, 600.0, 1.0, 0.0);
+        ui.text_input_masked_for(&mut form, &path, "Password", "");
+
+        // Buffer should contain actual text.
+        let buf = ui.form_buffers.get(&path).unwrap();
+        assert_eq!(buf.text(), "secret");
+
+        // Rendered text should be masked (bullets).
+        let run = ui
+            .batch
+            .text_runs
+            .iter()
+            .find(|r| r.text.contains('\u{2022}'))
+            .expect("expected masked text run");
+        assert_eq!(run.text, "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}");
     }
 }
