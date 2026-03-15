@@ -107,7 +107,7 @@ impl Ui {
             click_count: 0,
             last_click_time: 0.0,
             last_click_id: None,
-            scroll_offsets: std::collections::HashMap::new(),
+            _scroll_offsets: std::collections::HashMap::new(),
             overwrite_mode: false,
             id_stack: Vec::new(),
         }
