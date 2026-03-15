@@ -78,7 +78,7 @@ pub struct Ui {
     /// Widget id that received the last click, used to reset count on target change.
     last_click_id: Option<u64>,
     /// Scroll offsets per widget id (horizontal pixel offset into the text).
-    scroll_offsets: std::collections::HashMap<u64, f32>,
+    _scroll_offsets: std::collections::HashMap<u64, f32>,
     /// Whether the focused text input is in overwrite (insert-key toggle) mode.
     overwrite_mode: bool,
     /// ID stack used to disambiguate widgets with identical labels.
