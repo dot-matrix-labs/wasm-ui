@@ -1,7 +1,7 @@
 use serde::Serialize;
 use wasm_bindgen::JsValue;
 
-use ui_core::batch::{Batch, TextRun};
+use ui_core::batch::Batch;
 use ui_core::form::{FieldSchema, FieldType, FieldValue, Form, FormEvent, FormPath, FormSchema};
 use ui_core::input::{InputEvent, KeyCode, Modifiers, PointerButton, PointerEvent, TextInputEvent};
 use ui_core::text::TextBuffer;
@@ -34,7 +34,6 @@ struct PendingMock {
 
 pub struct FrameOutput {
     pub batch: Batch,
-    pub text_runs: Vec<TextRun>,
     pub a11y_json: JsValue,
 }
 
@@ -124,14 +123,12 @@ impl DemoApp {
 
         let a11y = self.ui.end_frame();
         self.clipboard_request = self.ui.clipboard_request.clone();
-        let mut batch = std::mem::take(&mut self.ui.batch);
-        let text_runs = std::mem::take(&mut batch.text_runs);
+        let batch = std::mem::take(&mut self.ui.batch);
         let serializer =
             serde_wasm_bindgen::Serializer::new().serialize_large_number_types_as_bigints(true);
         let a11y_json = a11y.serialize(&serializer).unwrap_or(JsValue::NULL);
         FrameOutput {
             batch,
-            text_runs,
             a11y_json,
         }
     }
