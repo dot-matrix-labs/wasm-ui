@@ -81,6 +81,15 @@ async function main() {
 
   const hiddenTextarea = createHiddenTextarea();
 
+  // --- IME composition state ---
+  // Track whether an IME composition session is active so we can suppress
+  // redundant text-input events that would cause double-insertion of the
+  // composed string.  We maintain our own flag in addition to checking
+  // e.isComposing on individual events because the relative ordering of
+  // compositionend vs beforeinput differs across browsers (Chrome fires
+  // compositionend first; Firefox fires beforeinput first).
+  let isComposing = false;
+
   // --- WebGL context loss / restoration ---
   let contextLost = false;
 
@@ -259,6 +268,13 @@ async function main() {
   }, { passive: false });
 
   window.addEventListener("keydown", (e) => {
+    // During an active IME composition the OS/browser is in control of the
+    // editing session.  Forwarding key events (arrows, backspace, etc.) to
+    // Wasm would interfere with the composition window.
+    if (e.isComposing || isComposing) {
+      return;
+    }
+
     const clipboardAction = isClipboardShortcut(e);
 
     if (clipboardAction === "copy" || clipboardAction === "cut") {
@@ -314,7 +330,16 @@ async function main() {
     app.handle_key_up(e.code, e.ctrlKey, e.altKey, e.shiftKey, e.metaKey);
   });
   window.addEventListener("beforeinput", (e) => {
-    if (e.data) {
+    // During IME composition the intermediate text is managed by the
+    // compositionupdate/compositionend handlers.  If we also forwarded the
+    // beforeinput data we would insert the composed string twice.
+    //
+    // We check both our manual flag AND e.isComposing because:
+    //   - Chrome fires compositionend *before* the final beforeinput, so
+    //     isComposing is already false but e.isComposing is still true.
+    //   - Firefox fires beforeinput *before* compositionend, so
+    //     e.isComposing may be false but isComposing is still true.
+    if (!e.isComposing && !isComposing && e.data) {
       app.handle_text_input(e.data);
     }
     // Prevent the browser from inserting text into the hidden textarea (or
@@ -324,9 +349,15 @@ async function main() {
       e.preventDefault();
     }
   });
-  window.addEventListener("compositionstart", () => app.handle_composition_start());
+  window.addEventListener("compositionstart", () => {
+    isComposing = true;
+    app.handle_composition_start();
+  });
   window.addEventListener("compositionupdate", (e) => app.handle_composition_update(e.data || ""));
-  window.addEventListener("compositionend", (e) => app.handle_composition_end(e.data || ""));
+  window.addEventListener("compositionend", (e) => {
+    isComposing = false;
+    app.handle_composition_end(e.data || "");
+  });
 
   // The native "paste" event fires when the user pastes via the browser
   // context menu or on mobile long-press.  Keyboard paste (Ctrl/Cmd+V) is
