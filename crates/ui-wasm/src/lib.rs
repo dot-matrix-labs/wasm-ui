@@ -3,7 +3,7 @@ mod demo;
 mod renderer;
 
 use demo::DemoApp;
-use renderer::Renderer;
+use renderer::{resolve_text_runs, Renderer};
 use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
 
@@ -43,7 +43,11 @@ impl WasmApp {
 
     pub fn frame(&mut self, timestamp_ms: f64) -> Result<JsValue, JsValue> {
         let output = self.demo.frame(self.width, self.height, self.scale, timestamp_ms);
-        self.renderer.render(output.batch, output.text_runs)?;
+        let mut batch = output.batch;
+        // Resolve text runs into vertex quads (rasterization + quad generation)
+        // BEFORE the render pass, so the renderer receives a complete batch.
+        resolve_text_runs(&mut batch, self.renderer.atlas_mut());
+        self.renderer.render(&batch)?;
         Ok(output.a11y_json)
     }
 

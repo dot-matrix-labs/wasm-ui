@@ -60,6 +60,24 @@ impl TextAtlas {
         }
     }
 
+    /// Pre-rasterize all glyphs in `text` at the given `font_size`, ensuring
+    /// they are cached in the atlas before the render pass begins.
+    pub fn ensure_glyphs_cached(&mut self, text: &str, font_size: f32) {
+        for ch in text.chars() {
+            if ch == '\n' {
+                continue;
+            }
+            self.ensure_glyph(ch, font_size);
+        }
+    }
+
+    /// Look up a previously cached glyph. Returns `None` if the glyph has not
+    /// been rasterized yet (callers on the render path should treat this as a
+    /// bug — layout should have pre-populated the atlas).
+    pub fn get_cached_glyph(&self, ch: char) -> Option<&Glyph> {
+        self.glyphs.get(&ch)
+    }
+
     pub fn ensure_glyph(&mut self, ch: char, font_size: f32) -> Glyph {
         if let Some(glyph) = self.glyphs.get(&ch) {
             return glyph.clone();

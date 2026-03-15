@@ -57,45 +57,18 @@ impl Renderer {
         self.atlas.set_font_bytes(bytes);
     }
 
-    pub fn render(&mut self, mut batch: Batch, text_runs: Vec<TextRun>) -> Result<(), JsValue> {
-        for run in text_runs {
-            self.push_text_quads(&mut batch, run);
-        }
-        let merged = batch;
-        self.upload_atlas_if_needed();
-        self.draw_batch(&merged)
+    /// Returns a mutable reference to the text atlas so that callers can
+    /// pre-rasterize glyphs during the layout pass (before rendering).
+    pub fn atlas_mut(&mut self) -> &mut TextAtlas {
+        &mut self.atlas
     }
 
-    fn push_text_quads(&mut self, batch: &mut Batch, run: TextRun) {
-        let mut x = run.rect.x;
-        let mut y = run.rect.y + run.rect.h * 0.7;
-        let font_size = run.font_size;
-        let line_height = font_size * 1.4;
-        for ch in run.text.chars() {
-            if ch == '\n' {
-                x = run.rect.x;
-                y += line_height;
-                continue;
-            }
-            let glyph = self.atlas.ensure_glyph(ch, font_size);
-            let rect = Rect::new(
-                x + glyph.bearing.x,
-                y - glyph.size.y + glyph.bearing.y,
-                glyph.size.x,
-                glyph.size.y,
-            );
-            batch.push_quad(
-                Quad {
-                    rect,
-                    uv: glyph.uv,
-                    color: run.color,
-                    flags: 1,
-                },
-                Material::TextAtlas,
-                run.clip,
-            );
-            x += glyph.advance;
-        }
+    /// Render a fully-resolved batch. All text runs must have already been
+    /// converted to quads (via [`resolve_text_runs`]) before calling this
+    /// method — the renderer only performs GPU upload and draw dispatch.
+    pub fn render(&mut self, batch: &Batch) -> Result<(), JsValue> {
+        self.upload_atlas_if_needed();
+        self.draw_batch(batch)
     }
 
     fn init_atlas_texture(&mut self) {
@@ -247,6 +220,57 @@ impl Renderer {
         gl.bind_texture(Gl::TEXTURE_2D, None);
         if let Some(loc) = gl.get_uniform_location(&self.program, "u_use_texture") {
             gl.uniform1i(Some(&loc), 0);
+        }
+    }
+}
+
+/// Convert text runs into vertex quads, rasterizing any missing glyphs into
+/// the atlas. This should be called **after** the layout pass and **before**
+/// [`Renderer::render`] so that the renderer receives an immutable, complete
+/// batch and the atlas texture upload happens only once per frame.
+pub fn resolve_text_runs(batch: &mut Batch, atlas: &mut TextAtlas) {
+    // Take the text runs out of the batch to avoid borrow conflicts.
+    let text_runs: Vec<TextRun> = batch.text_runs.drain(..).collect();
+
+    // First pass: ensure all glyphs are cached (rasterization).
+    for run in &text_runs {
+        atlas.ensure_glyphs_cached(&run.text, run.font_size);
+    }
+
+    // Second pass: emit quads using the now-populated atlas.
+    for run in &text_runs {
+        let mut x = run.rect.x;
+        let mut y = run.rect.y + run.rect.h * 0.7;
+        let font_size = run.font_size;
+        let line_height = font_size * 1.4;
+        for ch in run.text.chars() {
+            if ch == '\n' {
+                x = run.rect.x;
+                y += line_height;
+                continue;
+            }
+            // Glyph is guaranteed to be cached from the first pass.
+            let glyph = atlas.get_cached_glyph(ch).cloned().unwrap_or_else(|| {
+                // Fallback: rasterize on demand (should not happen).
+                atlas.ensure_glyph(ch, font_size)
+            });
+            let rect = Rect::new(
+                x + glyph.bearing.x,
+                y - glyph.size.y + glyph.bearing.y,
+                glyph.size.x,
+                glyph.size.y,
+            );
+            batch.push_quad(
+                Quad {
+                    rect,
+                    uv: glyph.uv,
+                    color: run.color,
+                    flags: 1,
+                },
+                Material::TextAtlas,
+                run.clip,
+            );
+            x += glyph.advance;
         }
     }
 }
