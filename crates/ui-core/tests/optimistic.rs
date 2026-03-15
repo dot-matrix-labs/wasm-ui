@@ -4,11 +4,13 @@ use ui_core::validation::ValidationRule;
 #[test]
 fn optimistic_submit_and_rollback() {
     let schema = FormSchema {
+        name: "test".to_string(),
         fields: vec![FieldSchema {
             id: "name".into(),
             label: "Name".into(),
             field_type: FieldType::Text,
             rules: vec![ValidationRule::Required],
+            placeholder: None,
         }],
     };
     let mut form = Form::new(schema);

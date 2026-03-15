@@ -217,12 +217,14 @@ impl DemoApp {
                         label: "Label".into(),
                         field_type: FieldType::Text,
                         rules: vec![ValidationRule::Required],
+                        placeholder: None,
                     },
                     FieldSchema {
                         id: "value".into(),
                         label: "Value".into(),
                         field_type: FieldType::Text,
                         rules: vec![ValidationRule::Email],
+                        placeholder: None,
                     },
                 ],
             );
@@ -444,141 +446,70 @@ fn map_button(button: u16) -> PointerButton {
 
 
 fn login_schema() -> FormSchema {
-    FormSchema {
-        fields: vec![
-            FieldSchema {
-                id: "email".into(),
-                label: "Email".into(),
-                field_type: FieldType::Text,
-                rules: vec![ValidationRule::Required, ValidationRule::Email],
-            },
-            FieldSchema {
-                id: "password".into(),
-                label: "Password".into(),
-                field_type: FieldType::Text,
-                rules: vec![ValidationRule::Required],
-            },
-        ],
-    }
+    FormSchema::new("login")
+        .field("email", FieldType::Text)
+        .with_label("email", "Email")
+        .required("email")
+        .with_validation("email", ValidationRule::Email)
+        .field("password", FieldType::Text)
+        .with_label("password", "Password")
+        .required("password")
 }
 
 fn register_schema() -> FormSchema {
-    FormSchema {
-        fields: vec![
-            FieldSchema {
-                id: "email".into(),
-                label: "Email".into(),
-                field_type: FieldType::Text,
-                rules: vec![ValidationRule::Required, ValidationRule::Email],
-            },
-            FieldSchema {
-                id: "password".into(),
-                label: "Password".into(),
-                field_type: FieldType::Text,
-                rules: vec![ValidationRule::Required],
-            },
-            FieldSchema {
-                id: "confirm".into(),
-                label: "Confirm Password".into(),
-                field_type: FieldType::Text,
-                rules: vec![ValidationRule::Required],
-            },
-            FieldSchema {
-                id: "role".into(),
-                label: "Role".into(),
-                field_type: FieldType::Select {
-                    options: vec!["User".into(), "Admin".into(), "Viewer".into()],
-                },
-                rules: vec![],
-            },
-        ],
-    }
+    FormSchema::new("register")
+        .field("email", FieldType::Text)
+        .with_label("email", "Email")
+        .required("email")
+        .with_validation("email", ValidationRule::Email)
+        .field("password", FieldType::Text)
+        .with_label("password", "Password")
+        .required("password")
+        .field("confirm", FieldType::Text)
+        .with_label("confirm", "Confirm Password")
+        .required("confirm")
+        .field("role", FieldType::Select {
+            options: vec!["User".into(), "Admin".into(), "Viewer".into()],
+        })
+        .with_label("role", "Role")
 }
 
 fn dynamic_schema() -> FormSchema {
-    FormSchema {
-        fields: vec![
-            FieldSchema {
-                id: "username".into(),
-                label: "Username".into(),
-                field_type: FieldType::Text,
-                rules: vec![
-                    ValidationRule::Required,
-                    ValidationRule::Regex {
-                        pattern: "^[a-zA-Z0-9_]{3,16}$".into(),
-                    },
-                ],
-            },
-            FieldSchema {
-                id: "age".into(),
-                label: "Age".into(),
-                field_type: FieldType::Number,
-                rules: vec![ValidationRule::NumberRange {
-                    min: Some(13.0),
-                    max: Some(120.0),
-                }],
-            },
-            FieldSchema {
-                id: "bio".into(),
-                label: "Bio".into(),
-                field_type: FieldType::Text,
-                rules: vec![],
-            },
-            FieldSchema {
-                id: "subscribe".into(),
-                label: "Subscribe".into(),
-                field_type: FieldType::Checkbox,
-                rules: vec![],
-            },
-        ],
-    }
+    FormSchema::new("dynamic")
+        .field("username", FieldType::Text)
+        .with_label("username", "Username")
+        .required("username")
+        .with_validation("username", ValidationRule::Regex {
+            pattern: "^[a-zA-Z0-9_]{3,16}$".into(),
+        })
+        .field("age", FieldType::Number)
+        .with_label("age", "Age")
+        .with_validation("age", ValidationRule::NumberRange {
+            min: Some(13.0),
+            max: Some(120.0),
+        })
+        .field("bio", FieldType::Text)
+        .with_label("bio", "Bio")
+        .field("subscribe", FieldType::Checkbox)
+        .with_label("subscribe", "Subscribe")
 }
 
 fn nested_schema() -> FormSchema {
-    FormSchema {
-        fields: vec![FieldSchema {
-            id: "profile".into(),
-            label: "Profile".into(),
-            field_type: FieldType::Group {
-                repeatable: false,
-                fields: vec![
-                    FieldSchema {
-                        id: "name".into(),
-                        label: "Full Name".into(),
-                        field_type: FieldType::Text,
-                        rules: vec![ValidationRule::Required],
-                    },
-                    FieldSchema {
-                        id: "email".into(),
-                        label: "Contact Email".into(),
-                        field_type: FieldType::Text,
-                        rules: vec![ValidationRule::Email],
-                    },
-                ],
-            },
-            rules: vec![],
-        },
-        FieldSchema {
-            id: "contacts".into(),
-            label: "Contacts".into(),
-            field_type: FieldType::Group {
-                repeatable: true,
-                fields: vec![
-                    FieldSchema {
-                        id: "label".into(),
-                        label: "Label".into(),
-                        field_type: FieldType::Text,
-                        rules: vec![ValidationRule::Required],
-                    },
-                    FieldSchema {
-                        id: "value".into(),
-                        label: "Value".into(),
-                        field_type: FieldType::Text,
-                        rules: vec![ValidationRule::Email],
-                    },
-                ],
-            },
-            rules: vec![],
-        }],
-    }
+    FormSchema::new("nested")
+        .group("profile", |s| {
+            s.field("name", FieldType::Text)
+                .with_label("name", "Full Name")
+                .required("name")
+                .field("email", FieldType::Text)
+                .with_label("email", "Contact Email")
+                .with_validation("email", ValidationRule::Email)
+        })
+        .repeatable_group("contacts", |s| {
+            s.field("label", FieldType::Text)
+                .with_label("label", "Label")
+                .required("label")
+                .field("value", FieldType::Text)
+                .with_label("value", "Value")
+                .with_validation("value", ValidationRule::Email)
+        })
 }
