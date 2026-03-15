@@ -48,9 +48,9 @@ jobs:
           cd crates/ui-wasm
           wasm-pack build --target web --release --out-dir ../../examples/web/pkg
 
-      # ── Install Chromium (headless) ───────────────────────────────────────────
-      #    Ubuntu runners ship with an up-to-date chromium package that supports
-      #    --headless=new and --remote-debugging-port out of the box.
+      # ── Install Chromium (headless, pinned version) ─────────────────────────
+      #    Pin chromium to a specific version for deterministic rendering.
+      #    When updating, regenerate baselines with CDP_UPDATE_BASELINES=1.
       - name: Install Chromium
         run: |
           sudo apt-get update -qq
@@ -61,7 +61,8 @@ jobs:
       #    cdp-runner reads all its settings from env vars (CDP_URL, CDP_PORT,
       #    CDP_HEADLESS, CDP_CHROME_BIN, CDP_SCREENSHOT_DIR).
       #    It starts the python HTTP server and Chromium itself internally.
-      - name: Run cdp-runner (Chromium + CDP)
+      #    Visual regression compares against tests/screenshots/baseline/.
+      - name: Run cdp-runner (Chromium + CDP + visual regression)
         env:
           CDP_URL: "http://127.0.0.1:8000/index.html"
           CDP_PORT: "9222"
@@ -69,6 +70,8 @@ jobs:
           CDP_CHROME_BIN: "chromium-browser"
           CDP_NO_SERVER: "0"   # let cdp-runner start the python server
           CDP_SCREENSHOT_DIR: "${{ github.workspace }}/screenshots"
+          CDP_BASELINE_DIR: "${{ github.workspace }}/tests/screenshots/baseline"
+          CDP_DIFF_THRESHOLD: "0.001"
         run: |
           mkdir -p screenshots
           cargo test -p cdp-runner -- --nocapture 2>&1
@@ -81,4 +84,17 @@ jobs:
           name: browser-screenshots-${{ github.run_number }}
           path: screenshots/
           if-no-files-found: warn
+          retention-days: 30
+
+      # ── Upload visual regression diffs on failure ────────────────────────────
+      - name: Upload visual regression diffs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: visual-regression-diffs-${{ github.run_number }}
+          path: |
+            screenshots/*_diff.png
+            screenshots/*_actual.png
+            screenshots/*_baseline.png
+          if-no-files-found: ignore
           retention-days: 30

@@ -8,6 +8,8 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+pub mod pixel_diff;
+
 pub struct Config {
     pub url: String,
     pub port: u16,
@@ -35,12 +37,17 @@ impl Default for Config {
     }
 }
 
-/// Capture a full-page PNG screenshot via CDP and write it to disk.
+/// Capture a full-page PNG screenshot via CDP, write it to disk, and
+/// optionally compare against a visual baseline.
+///
 /// If `screenshot_dir` is `None` the call is a no-op (returns `Ok(())`).
+/// When `CDP_UPDATE_BASELINES=1`, the captured screenshot is copied to the
+/// baseline directory instead of being compared.
 fn take_screenshot(
     cdp: &mut CdpClient,
     screenshot_dir: &Option<std::path::PathBuf>,
     name: &str,
+    regression_errors: &mut Vec<String>,
 ) -> Result<(), String> {
     let dir = match screenshot_dir {
         Some(d) => d,
@@ -64,6 +71,21 @@ fn take_screenshot(
     let path = dir.join(format!("{}.png", name));
     std::fs::write(&path, &bytes).map_err(|e| format!("screenshot write: {}", e))?;
     println!("[screenshot] saved {}", path.display());
+
+    // Visual regression: update baseline or compare.
+    if pixel_diff::should_update_baselines() {
+        pixel_diff::update_baseline(&path, name)?;
+    } else {
+        match pixel_diff::compare_screenshot(&bytes, name, dir) {
+            Ok(_) => {} // pass or no baseline
+            Err(e) => {
+                // Collect regression errors instead of failing immediately,
+                // so all screenshots are captured before the test reports.
+                regression_errors.push(e);
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -131,6 +153,7 @@ pub fn run(config: Config) -> Result<(), String> {
     };
     let mut ws = WebSocket::connect(&ws_url)?;
     let mut cdp = CdpClient::new(&mut ws);
+    let mut regression_errors: Vec<String> = Vec::new();
 
     cdp.send("Page.enable", "{}")?;
     cdp.send("Runtime.enable", "{}")?;
@@ -152,12 +175,12 @@ pub fn run(config: Config) -> Result<(), String> {
         Duration::from_secs(3),
     )?;
     wait_for_a11y(&mut cdp, "GPU Forms UI", Duration::from_secs(3))?;
-    take_screenshot(&mut cdp, &screenshot_dir, "01_loaded")?;
+    take_screenshot(&mut cdp, &screenshot_dir, "01_loaded", &mut regression_errors)?;
 
     click_named(&mut cdp, "Dynamic Validation")?;
     thread::sleep(Duration::from_millis(200));
     wait_for_a11y(&mut cdp, "Username", Duration::from_secs(3))?;
-    take_screenshot(&mut cdp, &screenshot_dir, "02_dynamic_form")?;
+    take_screenshot(&mut cdp, &screenshot_dir, "02_dynamic_form", &mut regression_errors)?;
 
     click_named(&mut cdp, "Username")?;
     cdp.eval_void("window.__app.handle_text_input('user1')")?;
@@ -165,19 +188,19 @@ pub fn run(config: Config) -> Result<(), String> {
     click_named(&mut cdp, "Age")?;
     cdp.eval_void("window.__app.handle_text_input('18')")?;
     tick_app(&mut cdp)?;
-    take_screenshot(&mut cdp, &screenshot_dir, "03_filled_form")?;
+    take_screenshot(&mut cdp, &screenshot_dir, "03_filled_form", &mut regression_errors)?;
 
     click_named(&mut cdp, "Submit Profile")?;
     wait_for_a11y(&mut cdp, "Submitting...", Duration::from_secs(2))?;
-    take_screenshot(&mut cdp, &screenshot_dir, "04_submitting")?;
+    take_screenshot(&mut cdp, &screenshot_dir, "04_submitting", &mut regression_errors)?;
     thread::sleep(Duration::from_millis(1100));
     wait_for_a11y(&mut cdp, "Saved successfully.", Duration::from_secs(3))?;
-    take_screenshot(&mut cdp, &screenshot_dir, "05_success")?;
+    take_screenshot(&mut cdp, &screenshot_dir, "05_success", &mut regression_errors)?;
 
     click_named(&mut cdp, "Submit Profile")?;
     thread::sleep(Duration::from_millis(1100));
     wait_for_a11y(&mut cdp, "Server error, rolled back.", Duration::from_secs(3))?;
-    take_screenshot(&mut cdp, &screenshot_dir, "06_rollback")?;
+    take_screenshot(&mut cdp, &screenshot_dir, "06_rollback", &mut regression_errors)?;
 
     if let Some(mut child) = chrome {
         let _ = child.kill();
@@ -188,6 +211,17 @@ pub fn run(config: Config) -> Result<(), String> {
     if let Some(dir) = profile_dir {
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    // Report visual regression failures after all screenshots are captured.
+    if !regression_errors.is_empty() {
+        let count = regression_errors.len();
+        let details = regression_errors.join("\n  ");
+        return Err(format!(
+            "{} visual regression(s) detected:\n  {}",
+            count, details
+        ));
+    }
+
     Ok(())
 }
 
