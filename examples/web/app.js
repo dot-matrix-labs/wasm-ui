@@ -4,6 +4,97 @@ const canvas = document.getElementById("app");
 const dpr = window.devicePixelRatio || 1;
 
 // ---------------------------------------------------------------------------
+// Frame budget monitoring
+//
+// Track frame times using a rolling window. Warn if 5+ consecutive frames
+// exceed the 12 ms budget. Store the last frame time on a module-level
+// variable so other code (and debug overlay) can read it.
+// ---------------------------------------------------------------------------
+
+/** Rolling window of recent frame times in ms (capped at FRAME_WINDOW_SIZE). */
+const FRAME_TIMES = [];
+const FRAME_WINDOW_SIZE = 60;
+const FRAME_BUDGET_MS = 12;
+const OVERRUN_WARN_THRESHOLD = 5;
+
+/** Last measured frame time in ms. Available to WASM runtime if needed. */
+let lastFrameTimeMs = 0;
+
+/** Count of consecutive frames that exceeded the budget. */
+let consecutiveOverruns = 0;
+
+/**
+ * Record a frame time sample, updating the rolling window and consecutive
+ * overrun counter. Emits a console.warn when sustained overruns are detected.
+ *
+ * @param {number} frameMs  Frame duration in milliseconds.
+ */
+function recordFrameTime(frameMs) {
+  lastFrameTimeMs = frameMs;
+  FRAME_TIMES.push(frameMs);
+  if (FRAME_TIMES.length > FRAME_WINDOW_SIZE) {
+    FRAME_TIMES.shift();
+  }
+
+  if (frameMs > FRAME_BUDGET_MS) {
+    consecutiveOverruns += 1;
+    if (consecutiveOverruns === OVERRUN_WARN_THRESHOLD) {
+      const avg = (FRAME_TIMES.slice(-OVERRUN_WARN_THRESHOLD)
+        .reduce((s, t) => s + t, 0) / OVERRUN_WARN_THRESHOLD).toFixed(1);
+      console.warn(
+        `[wham] Frame budget overrun: ${consecutiveOverruns} consecutive frames ` +
+        `exceeded ${FRAME_BUDGET_MS} ms (avg ${avg} ms over last ${OVERRUN_WARN_THRESHOLD} frames)`
+      );
+    }
+  } else {
+    consecutiveOverruns = 0;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Debug overlay
+//
+// When window.__WHAM_DEBUG is true before init(), a small DOM overlay is
+// rendered in the top-right corner showing FPS and frame time.
+// ---------------------------------------------------------------------------
+
+/**
+ * Create a DOM-based frame stats overlay and return an update function.
+ * The overlay is styled to be non-interactive and visually minimal.
+ *
+ * @returns {{ update: (frameMs: number) => void, el: HTMLElement }}
+ */
+function createFrameStatsOverlay() {
+  const el = document.createElement("div");
+  Object.assign(el.style, {
+    position: "fixed",
+    top: "8px",
+    right: "8px",
+    padding: "4px 8px",
+    background: "rgba(0,0,0,0.65)",
+    color: "#0f0",
+    fontFamily: "monospace",
+    fontSize: "11px",
+    lineHeight: "1.4",
+    borderRadius: "4px",
+    pointerEvents: "none",
+    zIndex: "9999",
+    userSelect: "none",
+    whiteSpace: "pre",
+  });
+  el.setAttribute("aria-hidden", "true");
+  document.body.appendChild(el);
+
+  function update(frameMs) {
+    const fps = frameMs > 0 ? (1000 / frameMs).toFixed(1) : "---";
+    const over = frameMs > FRAME_BUDGET_MS ? " !" : "  ";
+    el.textContent = `FPS  ${fps.padStart(6)}\nms  ${frameMs.toFixed(2).padStart(6)}${over}`;
+  }
+
+  return { update, el };
+}
+
+// ---------------------------------------------------------------------------
 // AccessibilityMirror — hidden DOM tree that mirrors canvas widgets for
 // screen readers.  Elements are visually hidden (sr-only pattern) but remain
 // in the accessibility tree so that NVDA, VoiceOver, TalkBack, etc. can
@@ -273,6 +364,56 @@ function resize() {
 }
 
 /**
+ * Read CSS env(safe-area-inset-*) values via a hidden probe element.
+ *
+ * Browsers expose hardware safe-area insets (notch, home indicator, rounded
+ * corners) only through CSS `env()`. We create a tiny off-screen element with
+ * inline `padding` set to each env value and measure the computed padding via
+ * `getComputedStyle`. The element is reused across calls.
+ *
+ * @returns {{ top: number, right: number, bottom: number, left: number }}
+ */
+let _safeAreaProbe = null;
+function readSafeAreaInsets() {
+  if (!_safeAreaProbe) {
+    _safeAreaProbe = document.createElement("div");
+    Object.assign(_safeAreaProbe.style, {
+      position: "fixed",
+      top: "0",
+      left: "0",
+      width: "0",
+      height: "0",
+      // Each padding edge reads one env() value. On browsers / devices that
+      // do not support these env() variables the padding falls back to 0px.
+      paddingTop: "env(safe-area-inset-top, 0px)",
+      paddingRight: "env(safe-area-inset-right, 0px)",
+      paddingBottom: "env(safe-area-inset-bottom, 0px)",
+      paddingLeft: "env(safe-area-inset-left, 0px)",
+      pointerEvents: "none",
+      visibility: "hidden",
+    });
+    document.body.appendChild(_safeAreaProbe);
+  }
+  const style = getComputedStyle(_safeAreaProbe);
+  return {
+    top: parseFloat(style.paddingTop) || 0,
+    right: parseFloat(style.paddingRight) || 0,
+    bottom: parseFloat(style.paddingBottom) || 0,
+    left: parseFloat(style.paddingLeft) || 0,
+  };
+}
+
+/**
+ * Read the current safe area insets and forward them to the WASM runtime.
+ *
+ * @param {WasmApp} app
+ */
+function updateSafeAreaInsets(app) {
+  const insets = readSafeAreaInsets();
+  app.set_safe_area_insets(insets.top, insets.right, insets.bottom, insets.left);
+}
+
+/**
  * Create a hidden textarea overlaying the canvas for mobile keyboard input.
  *
  * iOS Safari scrolls the viewport to bring focused elements into view, even
@@ -340,6 +481,16 @@ async function main() {
   resize();
   const app = new WasmApp(canvas, canvas.width, canvas.height, dpr);
   window.__app = app;
+
+  // Expose last frame time on window so external tooling or WASM can read it.
+  Object.defineProperty(window, "__whamLastFrameMs", {
+    get: () => lastFrameTimeMs,
+    enumerable: true,
+  });
+
+  // Debug overlay — opt-in via `window.__WHAM_DEBUG = true` before init().
+  const showFrameStats = !!(window.__WHAM_DEBUG);
+  const frameStatsOverlay = showFrameStats ? createFrameStatsOverlay() : null;
 
   const hiddenTextarea = createHiddenTextarea();
   const a11yMirror = new AccessibilityMirror(canvas, app, dpr);
@@ -641,17 +792,33 @@ async function main() {
     if (text) app.handle_paste(text);
   });
 
+  let prevFrameTs = 0;
+
   function frame(ts) {
     if (contextLost) {
+      prevFrameTs = ts;
       requestAnimationFrame(frame);
       return;
     }
+
+    // Measure frame duration. On the very first frame prevFrameTs is 0, so
+    // we skip recording to avoid an anomalously large first sample.
+    const frameMs = prevFrameTs > 0 ? ts - prevFrameTs : 0;
+    prevFrameTs = ts;
+
     const a11y = app.frame(ts);
     // NOTE: After calling app.frame() any typed-array views into
     // wasm.memory.buffer may have been detached by memory.grow.
     // We only use the JS object `a11y` (not a typed-array view) so no
     // re-acquisition is needed here.
     window.__a11y = a11y;
+
+    if (frameMs > 0) {
+      recordFrameTime(frameMs);
+      if (frameStatsOverlay) {
+        frameStatsOverlay.update(frameMs);
+      }
+    }
 
     // Update the accessibility shadow DOM mirror.
     a11yMirror.update(a11y);
