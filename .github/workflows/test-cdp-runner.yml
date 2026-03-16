@@ -1,0 +1,326 @@
+name: Browser Tests (cdp-runner)
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ── Shared: build WASM once, upload as artifact ──────────────────────────
+  build:
+    name: Build WASM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable + wasm32 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cdp-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cdp-
+
+      - name: Install wasm-pack
+        run: |
+          curl -sSL https://rustwasm.github.io/wasm-pack/installer/init.sh | sh
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build WASM (release)
+        run: cd crates/ui-wasm && wasm-pack build --target web --release --out-dir ../../examples/web/pkg
+
+      - name: Upload WASM pkg
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-pkg-${{ github.run_id }}
+          path: examples/web/pkg/
+          retention-days: 1
+
+  # ── Shared setup for all test jobs ───────────────────────────────────────
+  # (Each test job repeats these steps — GitHub Actions has no shared step
+  #  primitive. Chromium install is ~30s and cargo cache makes Rust build fast.)
+
+  # ── Test: initial canvas load ─────────────────────────────────────────────
+  test-app-load:
+    name: "Browser: initial canvas load"
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cdp-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cdp-
+      - name: Download WASM pkg
+        uses: actions/download-artifact@v4
+        with:
+          name: wasm-pkg-${{ github.run_id }}
+          path: examples/web/pkg/
+      - name: Install Chromium
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends chromium-browser
+      - name: Run test
+        env:
+          CDP_HEADLESS: "1"
+          CDP_CHROME_BIN: "chromium-browser"
+          CDP_SCREENSHOT_DIR: "${{ github.workspace }}/screenshots"
+        run: |
+          mkdir -p screenshots
+          cargo test -p cdp-runner initial_load_renders_canvas -- --nocapture
+      - name: Upload screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshot-app-load-${{ github.run_id }}
+          path: screenshots/
+          retention-days: 1
+
+  # ── Test: dynamic validation form ─────────────────────────────────────────
+  test-dynamic-form:
+    name: "Browser: dynamic validation form"
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cdp-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cdp-
+      - name: Download WASM pkg
+        uses: actions/download-artifact@v4
+        with:
+          name: wasm-pkg-${{ github.run_id }}
+          path: examples/web/pkg/
+      - name: Install Chromium
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends chromium-browser
+      - name: Run tests
+        env:
+          CDP_HEADLESS: "1"
+          CDP_CHROME_BIN: "chromium-browser"
+          CDP_SCREENSHOT_DIR: "${{ github.workspace }}/screenshots"
+        run: |
+          mkdir -p screenshots
+          cargo test -p cdp-runner dynamic_validation -- --nocapture --test-threads=1
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshot-dynamic-form-${{ github.run_id }}
+          path: screenshots/
+          retention-days: 1
+
+  # ── Test: form submit flow ─────────────────────────────────────────────────
+  test-submit-flow:
+    name: "Browser: form submit flow"
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cdp-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cdp-
+      - name: Download WASM pkg
+        uses: actions/download-artifact@v4
+        with:
+          name: wasm-pkg-${{ github.run_id }}
+          path: examples/web/pkg/
+      - name: Install Chromium
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends chromium-browser
+      - name: Run tests
+        env:
+          CDP_HEADLESS: "1"
+          CDP_CHROME_BIN: "chromium-browser"
+          CDP_SCREENSHOT_DIR: "${{ github.workspace }}/screenshots"
+        run: |
+          mkdir -p screenshots
+          cargo test -p cdp-runner form_submit -- --nocapture --test-threads=1
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshot-submit-flow-${{ github.run_id }}
+          path: screenshots/
+          retention-days: 1
+
+  # ── Test: sign-in scenario ────────────────────────────────────────────────
+  test-sign-in:
+    name: "Browser: sign-in form"
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cdp-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cdp-
+      - name: Download WASM pkg
+        uses: actions/download-artifact@v4
+        with:
+          name: wasm-pkg-${{ github.run_id }}
+          path: examples/web/pkg/
+      - name: Install Chromium
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends chromium-browser
+      - name: Run test
+        env:
+          CDP_HEADLESS: "1"
+          CDP_CHROME_BIN: "chromium-browser"
+          CDP_SCREENSHOT_DIR: "${{ github.workspace }}/screenshots"
+        run: |
+          mkdir -p screenshots
+          cargo test -p cdp-runner sign_in_form_loads -- --nocapture
+      - name: Upload screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshot-sign-in-${{ github.run_id }}
+          path: screenshots/
+          retention-days: 1
+
+  # ── Test: checkout scenario ───────────────────────────────────────────────
+  test-checkout:
+    name: "Browser: checkout form"
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cdp-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cdp-
+      - name: Download WASM pkg
+        uses: actions/download-artifact@v4
+        with:
+          name: wasm-pkg-${{ github.run_id }}
+          path: examples/web/pkg/
+      - name: Install Chromium
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends chromium-browser
+      - name: Run test
+        env:
+          CDP_HEADLESS: "1"
+          CDP_CHROME_BIN: "chromium-browser"
+          CDP_SCREENSHOT_DIR: "${{ github.workspace }}/screenshots"
+        run: |
+          mkdir -p screenshots
+          cargo test -p cdp-runner checkout_form_loads -- --nocapture
+      - name: Upload screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshot-checkout-${{ github.run_id }}
+          path: screenshots/
+          retention-days: 1
+
+  # ── Test: notification settings scenario ──────────────────────────────────
+  test-notifications:
+    name: "Browser: notification settings"
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cdp-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cdp-
+      - name: Download WASM pkg
+        uses: actions/download-artifact@v4
+        with:
+          name: wasm-pkg-${{ github.run_id }}
+          path: examples/web/pkg/
+      - name: Install Chromium
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends chromium-browser
+      - name: Run test
+        env:
+          CDP_HEADLESS: "1"
+          CDP_CHROME_BIN: "chromium-browser"
+          CDP_SCREENSHOT_DIR: "${{ github.workspace }}/screenshots"
+        run: |
+          mkdir -p screenshots
+          cargo test -p cdp-runner notifications_form_loads -- --nocapture
+      - name: Upload screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshot-notifications-${{ github.run_id }}
+          path: screenshots/
+          retention-days: 1
+
+  # ── Collect: merge all screenshots into one artifact ──────────────────────
+  collect-screenshots:
+    name: Collect all screenshots
+    needs:
+      - test-app-load
+      - test-dynamic-form
+      - test-submit-flow
+      - test-sign-in
+      - test-checkout
+      - test-notifications
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all screenshot artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: screenshot-*-${{ github.run_id }}
+          path: all-screenshots/
+          merge-multiple: true
+
+      - name: Upload combined screenshots
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-screenshots-${{ github.run_number }}
+          path: all-screenshots/
+          retention-days: 30
