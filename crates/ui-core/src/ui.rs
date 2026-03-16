@@ -262,7 +262,7 @@ pub struct Ui {
     /// Scroll offsets per widget id (horizontal pixel offset into the text).
     _scroll_offsets: HashMap<u64, f32>,
     /// Whether the focused text input is in overwrite (insert-key toggle) mode.
-    overwrite_mode: bool,
+    pub overwrite_mode: bool,
     /// Whether the viewport is a touch/mobile device (auto-detected from
     /// viewport width or device-pixel ratio). When true, small widgets get
     /// expanded hit areas to meet the 44×44pt minimum touch target guideline.
@@ -277,6 +277,14 @@ pub struct Ui {
     pub active_clip: Option<Rect>,
     /// Timestamp of the previous frame, used to compute dt for inertia.
     last_time_ms: f64,
+    /// Which select/dropdown widget is currently open (None = all closed).
+    pub dropdown_open: Option<u64>,
+    /// Index of the currently highlighted option in an open dropdown.
+    pub dropdown_highlighted: usize,
+    /// Deferred dropdown panel rendering data (rendered in end_frame for z-order).
+    dropdown_panel: Option<DropdownPanel>,
+    /// When a dropdown option was clicked last frame, stores (select_id, selected_index).
+    dropdown_selection: Option<(u64, usize)>,
     /// ID stack used to disambiguate widgets with identical labels.
     /// Values are pushed/popped by the caller (e.g. loop index) and mixed
     /// into every `hash_id` call so that repeated labels produce unique IDs.
@@ -297,6 +305,21 @@ pub struct Ui {
 
 /// Minimum touch target size in logical pixels (Apple HIG: 44pt).
 const MIN_TOUCH_TARGET: f32 = 44.0;
+
+/// Maximum number of visible options in a dropdown before it would need scrolling.
+const DROPDOWN_MAX_VISIBLE: usize = 6;
+/// Height of each option row in the dropdown panel.
+const DROPDOWN_ITEM_HEIGHT: f32 = 32.0;
+
+#[derive(Clone, Debug)]
+struct DropdownPanel {
+    id: u64,
+    trigger_rect: Rect,
+    panel_rect: Rect,
+    options: Vec<String>,
+    highlighted: usize,
+    _current_value: String,
+}
 
 impl Ui {
     pub fn new(width: f32, height: f32, theme: Theme) -> Self {
@@ -326,6 +349,10 @@ impl Ui {
             clip_stack: Vec::new(),
             active_clip: None,
             last_time_ms: 0.0,
+            dropdown_open: None,
+            dropdown_highlighted: 0,
+            dropdown_panel: None,
+            dropdown_selection: None,
             id_stack: Vec::new(),
             form_buffers: HashMap::new(),
             char_advance: Box::new(|_ch, font_size| font_size * 0.6),
@@ -450,6 +477,24 @@ impl Ui {
         self.last_time_ms = self.time_ms;
         self.time_ms = time_ms;
         self.touch_mode = width < 600.0 || scale >= 2.0;
+        // Store last dropdown panel rect before clearing, for click-outside detection
+        let prev_panel = self.dropdown_panel.take();
+        // Close dropdown on click-outside (not on trigger or panel)
+        if self.dropdown_open.is_some() {
+            if let Some(ref panel) = prev_panel {
+                for event in &self.events {
+                    if let InputEvent::PointerDown(ev) = event {
+                        if ev.button == Some(PointerButton::Left)
+                            && !panel.trigger_rect.contains(ev.pos)
+                            && !panel.panel_rect.contains(ev.pos)
+                        {
+                            self.dropdown_open = None;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
         // NOTE: selection_anchor is intentionally NOT cleared here.
         // It must persist across frames while the user is mid-drag.
         // It is cleared in apply_pointer_selection on PointerUp.
@@ -458,6 +503,7 @@ impl Ui {
     pub fn end_frame(&mut self) -> A11yTree {
         self.handle_keyboard_navigation();
         self.draw_focus_ring();
+        self.render_dropdown_panel();
         for widget in &self.widgets {
             self.hit_test.insert(HitTestEntry {
                 id: widget.id,
@@ -565,6 +611,87 @@ impl Ui {
             Material::Solid,
             None,
         );
+    }
+
+    fn render_dropdown_panel(&mut self) {
+        let panel = match self.dropdown_panel.take() {
+            Some(p) => p,
+            None => return,
+        };
+
+        // Panel background
+        self.batch.push_quad(
+            Quad {
+                rect: panel.panel_rect,
+                uv: Rect::new(0.0, 0.0, 1.0, 1.0),
+                color: self.theme.colors.surface,
+                flags: 0,
+            },
+            Material::Solid,
+            None,
+        );
+
+        let item_h = DROPDOWN_ITEM_HEIGHT * self.scale;
+        let font_size = 15.0 * self.theme.font_scale * self.scale;
+        let visible = panel.options.len().min(DROPDOWN_MAX_VISIBLE);
+
+        for (i, option) in panel.options.iter().enumerate().take(visible) {
+            let item_rect = Rect::new(
+                panel.panel_rect.x,
+                panel.panel_rect.y + i as f32 * item_h,
+                panel.panel_rect.w,
+                item_h,
+            );
+
+            // Highlight background
+            if i == panel.highlighted {
+                self.batch.push_quad(
+                    Quad {
+                        rect: item_rect,
+                        uv: Rect::new(0.0, 0.0, 1.0, 1.0),
+                        color: Color::rgba(
+                            self.theme.colors.primary.r,
+                            self.theme.colors.primary.g,
+                            self.theme.colors.primary.b,
+                            0.15,
+                        ),
+                        flags: 0,
+                    },
+                    Material::Solid,
+                    None,
+                );
+            }
+
+            // Option text
+            self.batch.text_runs.push(TextRun {
+                rect: Rect::new(item_rect.x + 8.0, item_rect.y, item_rect.w - 16.0, item_rect.h),
+                text: option.clone(),
+                color: self.theme.colors.text,
+                font_size,
+                clip: Some(item_rect),
+            });
+
+            // Handle click on option item — store selection for next frame
+            for event in &self.events.clone() {
+                if let InputEvent::PointerUp(ev) = event {
+                    if item_rect.contains(ev.pos) && ev.button == Some(PointerButton::Left) {
+                        self.dropdown_selection = Some((panel.id, i));
+                        self.dropdown_open = None;
+                    }
+                }
+            }
+
+            // Register hit-test entry for the option
+            self.hit_test.insert(HitTestEntry {
+                id: {
+                    let mut hasher = DefaultHasher::new();
+                    panel.id.hash(&mut hasher);
+                    i.hash(&mut hasher);
+                    hasher.finish()
+                },
+                rect: item_rect,
+            });
+        }
     }
 
     fn handle_keyboard_navigation(&mut self) {
@@ -842,14 +969,78 @@ impl Ui {
     pub fn select(&mut self, label: &str, options: &[String], value: &mut String) -> bool {
         let rect = self.layout.next_rect(36.0 * self.scale);
         let id = self.hash_id(label);
+        let is_open = self.dropdown_open == Some(id);
+
+        // --- Toggle open/close on click ---
         let clicked = self.rect_pressed(id, rect) && self.rect_released(id, rect);
         if clicked {
-            if let Some(pos) = options.iter().position(|v| v == value) {
-                let next = (pos + 1) % options.len();
-                *value = options[next].clone();
-            }
             self.focused = Some(id);
+            if is_open {
+                self.dropdown_open = None;
+            } else {
+                self.dropdown_open = Some(id);
+                self.dropdown_highlighted = options
+                    .iter()
+                    .position(|o| o == value)
+                    .unwrap_or(0);
+            }
         }
+        let is_open = self.dropdown_open == Some(id);
+
+        // --- Check for deferred selection from panel click last frame ---
+        let mut changed = false;
+        if let Some((sel_id, sel_idx)) = self.dropdown_selection.take() {
+            if sel_id == id {
+                if let Some(opt) = options.get(sel_idx) {
+                    *value = opt.clone();
+                    changed = true;
+                }
+            }
+        }
+
+        // --- Keyboard & type-ahead when open and focused ---
+        if is_open && self.focused == Some(id) {
+            for event in &self.events.clone() {
+                match event {
+                    InputEvent::KeyDown { code, .. } => match code {
+                        KeyCode::ArrowDown => {
+                            if self.dropdown_highlighted + 1 < options.len() {
+                                self.dropdown_highlighted += 1;
+                            }
+                        }
+                        KeyCode::ArrowUp => {
+                            if self.dropdown_highlighted > 0 {
+                                self.dropdown_highlighted -= 1;
+                            }
+                        }
+                        KeyCode::Enter => {
+                            if let Some(opt) = options.get(self.dropdown_highlighted) {
+                                *value = opt.clone();
+                                changed = true;
+                            }
+                            self.dropdown_open = None;
+                        }
+                        KeyCode::Escape => {
+                            self.dropdown_open = None;
+                        }
+                        _ => {}
+                    },
+                    InputEvent::TextInput(input) => {
+                        // Type-ahead: jump to first option starting with typed char
+                        let ch = input.text.to_lowercase();
+                        if let Some(idx) = options.iter().position(|o| {
+                            o.to_lowercase().starts_with(&ch)
+                        }) {
+                            self.dropdown_highlighted = idx;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // --- Render the select trigger ---
+        let is_open = self.dropdown_open == Some(id);
         let clip = self.effective_clip();
         self.batch.push_quad(
             Quad {
@@ -861,12 +1052,21 @@ impl Ui {
             Material::Solid,
             clip,
         );
-        let text = format!("{}: {}", label, value);
+        let display = format!("{}: {}", label, value);
         self.batch.text_runs.push(TextRun {
-            rect,
-            text,
+            rect: Rect::new(rect.x + 8.0, rect.y, rect.w - 32.0, rect.h),
+            text: display,
             color: self.theme.colors.text,
             font_size: 15.0 * self.theme.font_scale * self.scale,
+            clip,
+        });
+        // Down-arrow indicator
+        let arrow = if is_open { "\u{25B2}" } else { "\u{25BC}" };
+        self.batch.text_runs.push(TextRun {
+            rect: Rect::new(rect.x + rect.w - 24.0, rect.y, 16.0, rect.h),
+            text: arrow.to_string(),
+            color: self.theme.colors.text_muted,
+            font_size: 12.0 * self.theme.font_scale * self.scale,
             clip,
         });
 
@@ -881,12 +1081,27 @@ impl Ui {
                 disabled: false,
                 invalid: false,
                 required: false,
-                expanded: false,
+                expanded: is_open,
                 selected: true,
             },
         });
 
-        clicked
+        // --- Schedule dropdown panel for deferred rendering ---
+        if is_open {
+            let visible = options.len().min(DROPDOWN_MAX_VISIBLE);
+            let panel_h = visible as f32 * DROPDOWN_ITEM_HEIGHT * self.scale;
+            let panel_rect = Rect::new(rect.x, rect.y + rect.h, rect.w, panel_h);
+            self.dropdown_panel = Some(DropdownPanel {
+                id,
+                trigger_rect: rect,
+                panel_rect,
+                options: options.to_vec(),
+                highlighted: self.dropdown_highlighted,
+                _current_value: value.clone(),
+            });
+        }
+
+        changed
     }
 
     pub fn radio_group(&mut self, label: &str, options: &[String], selected: &mut usize) -> bool {
@@ -1855,7 +2070,7 @@ impl Ui {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::input::{Modifiers, PointerEvent};
+    use crate::input::{Modifiers, PointerEvent, TextInputEvent};
     use crate::theme::Theme;
 
     fn test_ui() -> Ui {
@@ -2778,5 +2993,153 @@ mod tests {
         let state = ui.scroll_states.get(&id).unwrap();
         assert!(state.offset <= state.max_offset(),
             "Offset should be clamped: offset={}, max={}", state.offset, state.max_offset());
+    }
+
+    // -----------------------------------------------------------------------
+    // Dropdown / Select widget
+    // -----------------------------------------------------------------------
+
+    fn test_options() -> Vec<String> {
+        vec!["Apple".into(), "Banana".into(), "Cherry".into(), "Date".into()]
+    }
+
+    #[test]
+    fn select_click_opens_dropdown() {
+        let mut ui = test_ui();
+        let options = test_options();
+        let mut value = "Apple".to_string();
+
+        // First frame: render select, get its rect
+        ui.begin_frame(vec![], 800.0, 600.0, 1.0, 0.0);
+        ui.select("Fruit", &options, &mut value);
+        let select_rect = ui.widgets.iter().find(|w| w.label == "Fruit").unwrap().rect;
+        let select_id = ui.widgets.iter().find(|w| w.label == "Fruit").unwrap().id;
+        ui.end_frame();
+
+        // Second frame: click on the select
+        let center = select_rect.center();
+        let events = vec![
+            InputEvent::PointerDown(PointerEvent {
+                pos: center,
+                button: Some(PointerButton::Left),
+                modifiers: Modifiers::default(),
+            }),
+            InputEvent::PointerUp(PointerEvent {
+                pos: center,
+                button: Some(PointerButton::Left),
+                modifiers: Modifiers::default(),
+            }),
+        ];
+        ui.begin_frame(events, 800.0, 600.0, 1.0, 0.0);
+        ui.select("Fruit", &options, &mut value);
+        assert_eq!(ui.dropdown_open, Some(select_id));
+        // Widget should report expanded
+        let w = ui.widgets.iter().find(|w| w.label == "Fruit").unwrap();
+        assert!(w.state.expanded);
+    }
+
+    #[test]
+    fn select_arrow_keys_navigate_options() {
+        let mut ui = test_ui();
+        let options = test_options();
+        let mut value = "Apple".to_string();
+
+        // Open the dropdown
+        let id = ui.hash_id("Fruit");
+        ui.dropdown_open = Some(id);
+        ui.dropdown_highlighted = 0;
+        ui.focused = Some(id);
+
+        // Press ArrowDown
+        let events = vec![InputEvent::KeyDown {
+            code: KeyCode::ArrowDown,
+            modifiers: Modifiers::default(),
+        }];
+        ui.begin_frame(events, 800.0, 600.0, 1.0, 0.0);
+        ui.select("Fruit", &options, &mut value);
+        assert_eq!(ui.dropdown_highlighted, 1);
+        // Value unchanged until Enter
+        assert_eq!(value, "Apple");
+    }
+
+    #[test]
+    fn select_enter_selects_highlighted() {
+        let mut ui = test_ui();
+        let options = test_options();
+        let mut value = "Apple".to_string();
+
+        let id = ui.hash_id("Fruit");
+        ui.dropdown_open = Some(id);
+        ui.dropdown_highlighted = 2; // Cherry
+        ui.focused = Some(id);
+
+        let events = vec![InputEvent::KeyDown {
+            code: KeyCode::Enter,
+            modifiers: Modifiers::default(),
+        }];
+        ui.begin_frame(events, 800.0, 600.0, 1.0, 0.0);
+        let changed = ui.select("Fruit", &options, &mut value);
+        assert!(changed);
+        assert_eq!(value, "Cherry");
+        assert_eq!(ui.dropdown_open, None); // closed after selection
+    }
+
+    #[test]
+    fn select_escape_closes_without_change() {
+        let mut ui = test_ui();
+        let options = test_options();
+        let mut value = "Banana".to_string();
+
+        let id = ui.hash_id("Fruit");
+        ui.dropdown_open = Some(id);
+        ui.dropdown_highlighted = 3;
+        ui.focused = Some(id);
+
+        let events = vec![InputEvent::KeyDown {
+            code: KeyCode::Escape,
+            modifiers: Modifiers::default(),
+        }];
+        ui.begin_frame(events, 800.0, 600.0, 1.0, 0.0);
+        let changed = ui.select("Fruit", &options, &mut value);
+        assert!(!changed);
+        assert_eq!(value, "Banana");
+        assert_eq!(ui.dropdown_open, None);
+    }
+
+    #[test]
+    fn select_type_ahead_jumps_to_matching_option() {
+        let mut ui = test_ui();
+        let options = test_options();
+        let mut value = "Apple".to_string();
+
+        let id = ui.hash_id("Fruit");
+        ui.dropdown_open = Some(id);
+        ui.dropdown_highlighted = 0;
+        ui.focused = Some(id);
+
+        let events = vec![InputEvent::TextInput(TextInputEvent {
+            text: "c".to_string(),
+        })];
+        ui.begin_frame(events, 800.0, 600.0, 1.0, 0.0);
+        ui.select("Fruit", &options, &mut value);
+        assert_eq!(ui.dropdown_highlighted, 2); // Cherry
+    }
+
+    #[test]
+    fn select_dropdown_renders_panel_in_end_frame() {
+        let mut ui = test_ui();
+        let options = test_options();
+        let mut value = "Apple".to_string();
+
+        let id = ui.hash_id("Fruit");
+        ui.dropdown_open = Some(id);
+        ui.focused = Some(id);
+        ui.begin_frame(vec![], 800.0, 600.0, 1.0, 0.0);
+        ui.select("Fruit", &options, &mut value);
+
+        let verts_before = ui.batch.vertices.len();
+        ui.end_frame();
+        // end_frame should have rendered the panel (background + highlighted item)
+        assert!(ui.batch.vertices.len() > verts_before);
     }
 }
