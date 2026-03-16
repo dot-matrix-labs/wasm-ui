@@ -273,6 +273,56 @@ function resize() {
 }
 
 /**
+ * Read CSS env(safe-area-inset-*) values via a hidden probe element.
+ *
+ * Browsers expose hardware safe-area insets (notch, home indicator, rounded
+ * corners) only through CSS `env()`. We create a tiny off-screen element with
+ * inline `padding` set to each env value and measure the computed padding via
+ * `getComputedStyle`. The element is reused across calls.
+ *
+ * @returns {{ top: number, right: number, bottom: number, left: number }}
+ */
+let _safeAreaProbe = null;
+function readSafeAreaInsets() {
+  if (!_safeAreaProbe) {
+    _safeAreaProbe = document.createElement("div");
+    Object.assign(_safeAreaProbe.style, {
+      position: "fixed",
+      top: "0",
+      left: "0",
+      width: "0",
+      height: "0",
+      // Each padding edge reads one env() value. On browsers / devices that
+      // do not support these env() variables the padding falls back to 0px.
+      paddingTop: "env(safe-area-inset-top, 0px)",
+      paddingRight: "env(safe-area-inset-right, 0px)",
+      paddingBottom: "env(safe-area-inset-bottom, 0px)",
+      paddingLeft: "env(safe-area-inset-left, 0px)",
+      pointerEvents: "none",
+      visibility: "hidden",
+    });
+    document.body.appendChild(_safeAreaProbe);
+  }
+  const style = getComputedStyle(_safeAreaProbe);
+  return {
+    top: parseFloat(style.paddingTop) || 0,
+    right: parseFloat(style.paddingRight) || 0,
+    bottom: parseFloat(style.paddingBottom) || 0,
+    left: parseFloat(style.paddingLeft) || 0,
+  };
+}
+
+/**
+ * Read the current safe area insets and forward them to the WASM runtime.
+ *
+ * @param {WasmApp} app
+ */
+function updateSafeAreaInsets(app) {
+  const insets = readSafeAreaInsets();
+  app.set_safe_area_insets(insets.top, insets.right, insets.bottom, insets.left);
+}
+
+/**
  * Create a hidden textarea overlaying the canvas for mobile keyboard input.
  *
  * iOS Safari scrolls the viewport to bring focused elements into view, even
@@ -383,9 +433,24 @@ async function main() {
     }
   });
 
+  // Send initial safe area insets before the first frame.
+  updateSafeAreaInsets(app);
+
   window.addEventListener("resize", () => {
     resize();
     app.resize(canvas.width, canvas.height, dpr);
+    // Safe area may change on resize (e.g. split-screen mode on iPad).
+    updateSafeAreaInsets(app);
+  });
+
+  // Orientation change on phones can flip which edges have insets.
+  window.addEventListener("orientationchange", () => {
+    // Wait one rAF for the browser to reflow and update env() values.
+    requestAnimationFrame(() => {
+      resize();
+      app.resize(canvas.width, canvas.height, dpr);
+      updateSafeAreaInsets(app);
+    });
   });
 
   // --- visualViewport resize (virtual keyboard open/close) ---
