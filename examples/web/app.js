@@ -806,6 +806,19 @@ async function main() {
   await init();
   resize();
   const app = new WasmApp(canvas, canvas.width, canvas.height, dpr);
+
+  // Load the primary font before exposing the app to external tooling.
+  // window.__app is set only after the font is ready so that any polling
+  // code (e.g. cdp-runner) that waits for window.__app can assume text
+  // will render on the very first frame() call.
+  try {
+    const fontResp = await fetch("Fallback.ttf");
+    const fontBuf = await fontResp.arrayBuffer();
+    app.set_font_bytes(new Uint8Array(fontBuf));
+  } catch (e) {
+    console.warn("wham: failed to load primary font, text will not render", e);
+  }
+
   window.__app = app;
 
   // Scenario routing — read ?scenario= query param and switch the active form.
