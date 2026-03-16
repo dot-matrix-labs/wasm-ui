@@ -2,7 +2,7 @@ use std::env;
 use serde_json::Value;
 use std::io::ErrorKind;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -28,11 +28,221 @@ impl Default for Config {
             port: env::var("CDP_PORT")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(9222),
+                .unwrap_or(0), // 0 = auto-pick a free port at launch time
             headless: env::var("CDP_HEADLESS").unwrap_or_else(|_| "1".to_string()) != "0",
             start_server: env::var("CDP_NO_SERVER").unwrap_or_else(|_| "0".to_string()) != "1",
             start_chrome: env::var("CDP_NO_CHROME").unwrap_or_else(|_| "0".to_string()) != "1",
             screenshot_dir: env::var("CDP_SCREENSHOT_DIR").ok().map(std::path::PathBuf::from),
+        }
+    }
+}
+
+/// A live browser session. Created with `BrowserSession::launch`, dropped to
+/// clean up Chrome and the file server.
+pub struct BrowserSession {
+    ws: WebSocket,
+    pub screenshot_dir: Option<std::path::PathBuf>,
+    chrome: Option<Child>,
+    server: Option<Child>,
+    profile_dir: Option<std::path::PathBuf>,
+    pub url: String,
+}
+
+impl BrowserSession {
+    /// Launch Chrome (and optionally a local HTTP server), connect the CDP
+    /// WebSocket, and enable the necessary domains.  Returns `Err` if Chrome
+    /// is not installed — callers should translate that into a graceful skip.
+    pub fn launch(config: &Config) -> Result<Self, String> {
+        // Resolve the HTTP server port: if the config URL contains port 0 or
+        // if we need to start a fresh server, pick a free port so parallel
+        // test sessions don't collide on 8000.
+        let (app_url, server) = if config.start_server {
+            let server_port = find_free_port();
+            let child = start_server(server_port)?;
+            thread::sleep(Duration::from_millis(300));
+            // Rewrite the base URL to use the dynamically allocated server port.
+            let url = replace_port_in_url(&config.url, server_port);
+            (url, Some(child))
+        } else {
+            (config.url.clone(), None)
+        };
+
+        // Resolve the CDP (Chrome remote debugging) port.
+        let cdp_port = if config.port == 0 { find_free_port() } else { config.port };
+
+        let (chrome, profile_dir, ws_url) = if config.start_chrome {
+            let (child, dir, ws_url) =
+                start_chrome_with_retry(cdp_port, config.headless, &app_url)?;
+            (Some(child), Some(dir), ws_url)
+        } else {
+            return Err("CDP_NO_CHROME is set; chromium must be started explicitly".to_string());
+        };
+
+        let mut ws = WebSocket::connect(&ws_url)?;
+        {
+            let mut cdp = CdpClient::new(&mut ws);
+            cdp.send("Page.enable", "{}")?;
+            cdp.send("Runtime.enable", "{}")?;
+            cdp.send("Input.enable", "{}")?;
+        }
+
+        Ok(Self {
+            ws,
+            screenshot_dir: config.screenshot_dir.clone(),
+            chrome,
+            server,
+            profile_dir,
+            url: app_url,
+        })
+    }
+
+    /// Navigate to the configured URL and wait for the app to be ready.
+    /// After this call the app home screen is visible.
+    pub fn navigate_to_app(&mut self) -> Result<(), String> {
+        let url = self.url.clone();
+        let mut cdp = CdpClient::new(&mut self.ws);
+        cdp.send(
+            "Page.navigate",
+            &format!("{{\"url\":\"{}\"}}", url.replace('"', "\\\"")),
+        )?;
+        wait_for_eval_contains(
+            &mut cdp,
+            "document.readyState",
+            "complete",
+            Duration::from_secs(3),
+        )?;
+        wait_for_eval_contains(
+            &mut cdp,
+            "window.__app ? \"ready\" : \"\"",
+            "ready",
+            Duration::from_secs(3),
+        )?;
+        wait_for_a11y(&mut cdp, "GPU Forms UI", Duration::from_secs(3))?;
+        Ok(())
+    }
+
+    /// Click the Dynamic Validation link and wait for the form to appear.
+    /// Assumes `navigate_to_app` has already been called.
+    pub fn open_dynamic_form(&mut self) -> Result<(), String> {
+        let mut cdp = CdpClient::new(&mut self.ws);
+        click_named(&mut cdp, "Dynamic Validation")?;
+        thread::sleep(Duration::from_millis(200));
+        wait_for_a11y(&mut cdp, "Username", Duration::from_secs(3))?;
+        Ok(())
+    }
+
+    /// Type valid values into the Username and Age fields.
+    /// Assumes the dynamic form is already open.
+    pub fn fill_form_valid_input(&mut self) -> Result<(), String> {
+        let mut cdp = CdpClient::new(&mut self.ws);
+        click_named(&mut cdp, "Username")?;
+        cdp.eval_void("window.__app.handle_text_input('user1')")?;
+        tick_app(&mut cdp)?;
+        click_named(&mut cdp, "Age")?;
+        cdp.eval_void("window.__app.handle_text_input('18')")?;
+        tick_app(&mut cdp)?;
+        Ok(())
+    }
+
+    /// Click Submit and wait for the submitting indicator.
+    /// Assumes the form has been filled with valid input.
+    pub fn click_submit_and_wait_for_submitting(&mut self) -> Result<(), String> {
+        let mut cdp = CdpClient::new(&mut self.ws);
+        click_named(&mut cdp, "Submit Profile")?;
+        wait_for_a11y(&mut cdp, "Submitting...", Duration::from_secs(2))?;
+        Ok(())
+    }
+
+    /// Wait for the success confirmation after a submit completes.
+    /// Assumes the submitting state is already showing.
+    pub fn wait_for_success(&mut self) -> Result<(), String> {
+        let mut cdp = CdpClient::new(&mut self.ws);
+        thread::sleep(Duration::from_millis(1100));
+        wait_for_a11y(&mut cdp, "Saved successfully.", Duration::from_secs(3))?;
+        Ok(())
+    }
+
+    /// Click Submit a second time and wait for the server-error rollback message.
+    /// Assumes the success state is currently showing.
+    pub fn click_submit_again_and_wait_for_rollback(&mut self) -> Result<(), String> {
+        let mut cdp = CdpClient::new(&mut self.ws);
+        click_named(&mut cdp, "Submit Profile")?;
+        thread::sleep(Duration::from_millis(1100));
+        wait_for_a11y(&mut cdp, "Server error, rolled back.", Duration::from_secs(3))?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Composite helpers used by individual tests to reach a known start state
+    // -----------------------------------------------------------------------
+
+    /// Fresh load → app home screen.
+    pub fn setup_initial_load(&mut self) -> Result<(), String> {
+        self.navigate_to_app()
+    }
+
+    /// Fresh load → dynamic validation form open.
+    pub fn setup_dynamic_form(&mut self) -> Result<(), String> {
+        self.navigate_to_app()?;
+        self.open_dynamic_form()
+    }
+
+    /// Fresh load → form filled with valid input.
+    pub fn setup_filled_form(&mut self) -> Result<(), String> {
+        self.setup_dynamic_form()?;
+        self.fill_form_valid_input()
+    }
+
+    /// Fresh load → submitting indicator showing.
+    pub fn setup_submitting_state(&mut self) -> Result<(), String> {
+        self.setup_filled_form()?;
+        self.click_submit_and_wait_for_submitting()
+    }
+
+    /// Fresh load → success confirmation showing.
+    pub fn setup_success_state(&mut self) -> Result<(), String> {
+        self.setup_submitting_state()?;
+        self.wait_for_success()
+    }
+
+    /// Fresh load → rollback/server-error message showing.
+    pub fn setup_rollback_state(&mut self) -> Result<(), String> {
+        self.setup_success_state()?;
+        self.click_submit_again_and_wait_for_rollback()
+    }
+
+    /// Take a screenshot and optionally run a visual regression check.
+    /// Returns any regression errors via `regression_errors`.
+    pub fn take_screenshot(
+        &mut self,
+        name: &str,
+        regression_errors: &mut Vec<String>,
+    ) -> Result<(), String> {
+        let mut cdp = CdpClient::new(&mut self.ws);
+        // Tick the app a few more times and wait for the compositor to flush
+        // the WebGL frame to the surface before capturing.  Without this the
+        // screenshot races against the GPU pipeline and may show the previous
+        // frame, making all captures look identical.
+        for _ in 0..3 {
+            let _ = cdp.eval_void(
+                "window.__app && (window.__a11y = window.__app.frame(performance.now()))",
+            );
+        }
+        thread::sleep(Duration::from_millis(150));
+        take_screenshot(&mut cdp, &self.screenshot_dir, name, regression_errors)
+    }
+}
+
+impl Drop for BrowserSession {
+    fn drop(&mut self) {
+        if let Some(ref mut child) = self.chrome {
+            let _ = child.kill();
+        }
+        if let Some(ref mut child) = self.server {
+            let _ = child.kill();
+        }
+        if let Some(ref dir) = self.profile_dir {
+            let _ = std::fs::remove_dir_all(dir);
         }
     }
 }
@@ -137,80 +347,32 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, &'static str> {
 }
 
 pub fn run(config: Config) -> Result<(), String> {
-    let screenshot_dir = config.screenshot_dir.clone();
-    let mut server = None;
-    if config.start_server {
-        server = Some(start_server()?);
-        thread::sleep(Duration::from_millis(200));
-    }
-
-    let (chrome, profile_dir, ws_url) = if config.start_chrome {
-        let (child, dir, ws_url) =
-            start_chrome_with_retry(config.port, config.headless, &config.url)?;
-        (Some(child), Some(dir), ws_url)
-    } else {
-        return Err("CDP_NO_CHROME is set; chromium must be started explicitly".to_string());
-    };
-    let mut ws = WebSocket::connect(&ws_url)?;
-    let mut cdp = CdpClient::new(&mut ws);
+    let mut session = BrowserSession::launch(&config)?;
     let mut regression_errors: Vec<String> = Vec::new();
 
-    cdp.send("Page.enable", "{}")?;
-    cdp.send("Runtime.enable", "{}")?;
-    cdp.send("Input.enable", "{}")?;
-    cdp.send(
-        "Page.navigate",
-        &format!("{{\"url\":\"{}\"}}", config.url.replace('"', "\\\"")),
-    )?;
-    wait_for_eval_contains(
-        &mut cdp,
-        "document.readyState",
-        "complete",
-        Duration::from_secs(3),
-    )?;
-    wait_for_eval_contains(
-        &mut cdp,
-        "window.__app ? \"ready\" : \"\"",
-        "ready",
-        Duration::from_secs(3),
-    )?;
-    wait_for_a11y(&mut cdp, "GPU Forms UI", Duration::from_secs(3))?;
-    take_screenshot(&mut cdp, &screenshot_dir, "01_loaded", &mut regression_errors)?;
+    // Step 1 — initial load
+    session.navigate_to_app()?;
+    session.take_screenshot("01_loaded", &mut regression_errors)?;
 
-    click_named(&mut cdp, "Dynamic Validation")?;
-    thread::sleep(Duration::from_millis(200));
-    wait_for_a11y(&mut cdp, "Username", Duration::from_secs(3))?;
-    take_screenshot(&mut cdp, &screenshot_dir, "02_dynamic_form", &mut regression_errors)?;
+    // Step 2 — open the Dynamic Validation form
+    session.open_dynamic_form()?;
+    session.take_screenshot("02_dynamic_form", &mut regression_errors)?;
 
-    click_named(&mut cdp, "Username")?;
-    cdp.eval_void("window.__app.handle_text_input('user1')")?;
-    tick_app(&mut cdp)?;
-    click_named(&mut cdp, "Age")?;
-    cdp.eval_void("window.__app.handle_text_input('18')")?;
-    tick_app(&mut cdp)?;
-    take_screenshot(&mut cdp, &screenshot_dir, "03_filled_form", &mut regression_errors)?;
+    // Step 3 — fill in valid input
+    session.fill_form_valid_input()?;
+    session.take_screenshot("03_filled_form", &mut regression_errors)?;
 
-    click_named(&mut cdp, "Submit Profile")?;
-    wait_for_a11y(&mut cdp, "Submitting...", Duration::from_secs(2))?;
-    take_screenshot(&mut cdp, &screenshot_dir, "04_submitting", &mut regression_errors)?;
-    thread::sleep(Duration::from_millis(1100));
-    wait_for_a11y(&mut cdp, "Saved successfully.", Duration::from_secs(3))?;
-    take_screenshot(&mut cdp, &screenshot_dir, "05_success", &mut regression_errors)?;
+    // Step 4 — submit and capture the submitting indicator
+    session.click_submit_and_wait_for_submitting()?;
+    session.take_screenshot("04_submitting", &mut regression_errors)?;
 
-    click_named(&mut cdp, "Submit Profile")?;
-    thread::sleep(Duration::from_millis(1100));
-    wait_for_a11y(&mut cdp, "Server error, rolled back.", Duration::from_secs(3))?;
-    take_screenshot(&mut cdp, &screenshot_dir, "06_rollback", &mut regression_errors)?;
+    // Step 5 — wait for success confirmation
+    session.wait_for_success()?;
+    session.take_screenshot("05_success", &mut regression_errors)?;
 
-    if let Some(mut child) = chrome {
-        let _ = child.kill();
-    }
-    if let Some(mut child) = server {
-        let _ = child.kill();
-    }
-    if let Some(dir) = profile_dir {
-        let _ = std::fs::remove_dir_all(dir);
-    }
+    // Step 6 — re-submit to trigger server error rollback
+    session.click_submit_again_and_wait_for_rollback()?;
+    session.take_screenshot("06_rollback", &mut regression_errors)?;
 
     // Report visual regression failures after all screenshots are captured.
     if !regression_errors.is_empty() {
@@ -225,24 +387,51 @@ pub fn run(config: Config) -> Result<(), String> {
     Ok(())
 }
 
-fn start_server() -> Result<Child, String> {
-    match spawn_server("python3") {
+/// Bind to port 0 and let the OS assign a free port, then return it.
+fn find_free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .expect("find_free_port: bind failed")
+        .local_addr()
+        .expect("find_free_port: local_addr failed")
+        .port()
+}
+
+/// Replace the port number in a URL like `http://127.0.0.1:8000/path` with
+/// `new_port`.  If no port is present the URL is returned unchanged.
+fn replace_port_in_url(url: &str, new_port: u16) -> String {
+    // Match "://host:port" and replace only the port digits.
+    if let Some(authority_start) = url.find("://") {
+        let after = &url[authority_start + 3..];
+        if let Some(colon) = after.find(':') {
+            let port_start = authority_start + 3 + colon + 1;
+            let port_end = url[port_start..]
+                .find(|c: char| !c.is_ascii_digit())
+                .map(|n| port_start + n)
+                .unwrap_or(url.len());
+            return format!("{}{}{}", &url[..port_start], new_port, &url[port_end..]);
+        }
+    }
+    url.to_string()
+}
+
+fn start_server(port: u16) -> Result<Child, String> {
+    match spawn_server("python3", port) {
         Ok(child) => Ok(child),
         Err(err) if err.kind() == ErrorKind::NotFound => {
-            spawn_server("python").map_err(|e| format!("server start failed: {}", e))
+            spawn_server("python", port).map_err(|e| format!("server start failed: {}", e))
         }
         Err(err) => Err(format!("server start failed: {}", err)),
     }
 }
 
-fn spawn_server(bin: &str) -> std::io::Result<Child> {
+fn spawn_server(bin: &str, port: u16) -> std::io::Result<Child> {
     let mut web_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     web_root.push("..");
     web_root.push("..");
     web_root.push("examples");
     web_root.push("web");
     let mut cmd = Command::new(bin);
-    cmd.arg("-m").arg("http.server").arg("8000");
+    cmd.arg("-m").arg("http.server").arg(port.to_string());
     cmd.current_dir(web_root);
     cmd.stdout(Stdio::null()).stderr(Stdio::null());
     cmd.spawn()
