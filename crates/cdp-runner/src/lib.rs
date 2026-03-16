@@ -219,6 +219,16 @@ impl BrowserSession {
         regression_errors: &mut Vec<String>,
     ) -> Result<(), String> {
         let mut cdp = CdpClient::new(&mut self.ws);
+        // Tick the app a few more times and wait for the compositor to flush
+        // the WebGL frame to the surface before capturing.  Without this the
+        // screenshot races against the GPU pipeline and may show the previous
+        // frame, making all captures look identical.
+        for _ in 0..3 {
+            let _ = cdp.eval_void(
+                "window.__app && (window.__a11y = window.__app.frame(performance.now()))",
+            );
+        }
+        thread::sleep(Duration::from_millis(150));
         take_screenshot(&mut cdp, &self.screenshot_dir, name, regression_errors)
     }
 }
