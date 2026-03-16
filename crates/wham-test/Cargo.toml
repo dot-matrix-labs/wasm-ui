@@ -1,0 +1,14 @@
+[package]
+name = "wham-test"
+version = "0.1.0"
+edition = "2021"
+description = "Visual regression test helpers for the wham GPU-rendered forms library"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+ui-core = { path = "../ui-core" }
+png = "0.17"
+
+[dev-dependencies]
