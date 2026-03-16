@@ -6,6 +6,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  actions: write  # required to delete intermediary screenshot artifacts
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -324,3 +327,12 @@ jobs:
           name: browser-screenshots-${{ github.run_number }}
           path: all-screenshots/
           retention-days: 30
+
+      - name: Delete intermediary screenshot artifacts
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" \
+            --jq '.artifacts[] | select(.name | startswith("screenshot-")) | .id' \
+          | xargs -I{} gh api "repos/${{ github.repository }}/actions/artifacts/{}" --method DELETE
