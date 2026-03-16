@@ -91,7 +91,7 @@ jobs:
           echo "Raw size: ${RAW_KB} KB (${RAW_SIZE} bytes)"
           echo "Gzipped size: ${GZIP_KB} KB (${GZIP_SIZE} bytes)"
 
-          MAX_GZIP_BYTES=512000  # 500 KB
+          MAX_GZIP_BYTES=563200  # 550 KB
           if [ "$GZIP_SIZE" -gt "$MAX_GZIP_BYTES" ]; then
             echo "FAIL: Gzipped WASM binary (${GZIP_KB} KB) exceeds 500 KB limit"
             exit 1

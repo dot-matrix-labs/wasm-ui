@@ -4,6 +4,7 @@ use web_sys::HtmlCanvasElement;
 
 use ui_core::app::FormApp;
 use ui_core::form::Form;
+use ui_core::icon::IconPack;
 use ui_core::input::{
     InputEvent, KeyCode, Modifiers, PointerButton, PointerEvent, TextInputEvent,
 };
@@ -121,6 +122,22 @@ impl<A: FormApp> WasmRuntime<A> {
     /// Append a fallback font to the renderer's text atlas fallback chain.
     pub fn add_fallback_font(&mut self, bytes: Vec<u8>) {
         self.renderer.add_fallback_font(bytes);
+    }
+
+    /// Load an icon pack from raw RGBA pixel data and a JSON manifest.
+    pub fn load_icon_pack(
+        &mut self,
+        rgba_pixels: Vec<u8>,
+        width: u32,
+        height: u32,
+        metadata_json: &str,
+    ) -> Result<(), String> {
+        let pack = IconPack::from_manifest(metadata_json)?;
+        self.ui.set_icon_pack(pack.clone());
+        self.renderer
+            .icon_atlas_mut()
+            .load(rgba_pixels, width, height, pack);
+        Ok(())
     }
 
     // -----------------------------------------------------------------

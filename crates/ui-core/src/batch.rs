@@ -29,6 +29,7 @@ pub struct DrawCmd {
 pub enum Material {
     Solid,
     TextAtlas,
+    IconAtlas,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -262,5 +263,24 @@ mod tests {
         batch.push_quad(solid_quad(1.0, 0.0, 1.0, 1.0), Material::TextAtlas, None);
         batch.push_quad(solid_quad(2.0, 0.0, 1.0, 1.0), Material::Solid, None);
         assert_eq!(batch.commands.len(), 3);
+    }
+
+    #[test]
+    fn icon_atlas_material_creates_separate_command() {
+        let mut batch = Batch::default();
+        batch.push_quad(solid_quad(0.0, 0.0, 1.0, 1.0), Material::Solid, None);
+        batch.push_quad(solid_quad(1.0, 0.0, 1.0, 1.0), Material::IconAtlas, None);
+        assert_eq!(batch.commands.len(), 2);
+        assert_eq!(batch.commands[1].material, Material::IconAtlas);
+    }
+
+    #[test]
+    fn icon_atlas_quads_batch_together() {
+        let mut batch = Batch::default();
+        batch.push_quad(solid_quad(0.0, 0.0, 1.0, 1.0), Material::IconAtlas, None);
+        batch.push_quad(solid_quad(1.0, 0.0, 1.0, 1.0), Material::IconAtlas, None);
+        assert_eq!(batch.commands.len(), 1);
+        assert_eq!(batch.commands[0].count, 12);
+        assert_eq!(batch.commands[0].material, Material::IconAtlas);
     }
 }

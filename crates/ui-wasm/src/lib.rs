@@ -1,5 +1,6 @@
 mod atlas;
 mod demo;
+mod icon_atlas;
 mod renderer;
 pub mod runtime;
 
@@ -37,6 +38,32 @@ impl WasmApp {
     /// falling back to the Unicode replacement character (U+FFFD).
     pub fn add_fallback_font(&mut self, bytes: Vec<u8>) {
         self.runtime.add_fallback_font(bytes);
+    }
+
+    /// Load an icon pack from a sprite sheet PNG (raw RGBA bytes) and a JSON
+    /// manifest describing the icon positions within the texture.
+    ///
+    /// The manifest format is:
+    /// ```json
+    /// {
+    ///   "name": "my-icons",
+    ///   "texture_size": [512, 512],
+    ///   "icons": [
+    ///     { "name": "check", "x": 0, "y": 0, "w": 24, "h": 24 },
+    ///     ...
+    ///   ]
+    /// }
+    /// ```
+    pub fn load_icon_pack(
+        &mut self,
+        rgba_pixels: Vec<u8>,
+        width: u32,
+        height: u32,
+        metadata_json: &str,
+    ) -> Result<(), JsValue> {
+        self.runtime
+            .load_icon_pack(rgba_pixels, width, height, metadata_json)
+            .map_err(|e| JsValue::from_str(&e))
     }
 
     pub fn frame(&mut self, timestamp_ms: f64) -> Result<JsValue, JsValue> {
