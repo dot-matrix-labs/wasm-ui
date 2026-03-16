@@ -3,6 +3,7 @@ pub mod app;
 pub mod batch;
 pub mod form;
 pub mod hit_test;
+pub mod icon;
 pub mod input;
 pub mod state;
 pub mod text;
@@ -14,6 +15,7 @@ pub mod validation;
 pub use accessibility::{A11yNode, A11yRole, A11yState, A11yTree};
 pub use app::FormApp;
 pub use batch::{Batch, DrawCmd, Material, Quad, TextRun, Vertex};
+pub use icon::{IconEntry, IconId, IconPack};
 pub use form::{
     FieldId, FieldSchema, FieldState, FieldType, FieldValue, Form, FormEvent, FormPath, FormSchema,
     FormState, PendingSubmission,
@@ -35,6 +37,7 @@ pub mod prelude {
     pub use crate::accessibility::{A11yNode, A11yRole, A11yState, A11yTree};
     pub use crate::app::FormApp;
     pub use crate::batch::{Batch, DrawCmd, Quad, TextRun, Vertex};
+    pub use crate::icon::{IconId, IconPack};
     pub use crate::form::{
         FieldId, FieldSchema, FieldType, FieldValue, Form, FormEvent, FormPath, FormSchema,
     };

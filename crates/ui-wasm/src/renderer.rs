@@ -5,6 +5,7 @@ use ui_core::batch::{Batch, Material, Quad, TextRun};
 use ui_core::types::Rect;
 
 use crate::atlas::TextAtlas;
+use crate::icon_atlas::IconAtlas;
 
 pub struct Renderer {
     gl: Gl,
@@ -14,6 +15,8 @@ pub struct Renderer {
     atlas: TextAtlas,
     /// One GPU texture per atlas page.
     atlas_textures: Vec<WebGlTexture>,
+    icon_atlas: IconAtlas,
+    icon_texture: WebGlTexture,
     width: f32,
     height: f32,
     context_valid: bool,
@@ -35,6 +38,7 @@ impl Renderer {
         // Create the initial texture for page 0.
         let tex = create_atlas_texture(&gl)?;
         let atlas_textures = vec![tex];
+        let icon_texture = gl.create_texture().ok_or_else(|| JsValue::from_str("no icon texture"))?;
 
         let mut renderer = Self {
             gl,
@@ -43,6 +47,8 @@ impl Renderer {
             ibo,
             atlas: TextAtlas::new(1024, 1024),
             atlas_textures,
+            icon_atlas: IconAtlas::new(),
+            icon_texture,
             width,
             height,
             context_valid: true,
@@ -82,6 +88,7 @@ impl Renderer {
             let tex = create_atlas_texture(&self.gl)?;
             self.atlas_textures.push(tex);
         }
+        self.icon_texture = self.gl.create_texture().ok_or_else(|| JsValue::from_str("no icon texture"))?;
 
         self.gl.use_program(Some(&self.program));
         self.gl.enable(Gl::BLEND);
@@ -90,6 +97,7 @@ impl Renderer {
         // The atlas pixel data in CPU memory is still valid; mark it dirty so
         // the full texture is re-uploaded on the next frame.
         self.atlas.invalidate_gpu_cache();
+        self.icon_atlas.invalidate_gpu_cache();
         self.init_atlas_textures();
         self.resize(self.width, self.height);
 
@@ -123,6 +131,16 @@ impl Renderer {
         &mut self.atlas
     }
 
+    /// Returns a mutable reference to the icon atlas for loading icon packs.
+    pub fn icon_atlas_mut(&mut self) -> &mut IconAtlas {
+        &mut self.icon_atlas
+    }
+
+    /// Returns a reference to the icon atlas (for reading the icon pack).
+    pub fn icon_atlas(&self) -> &IconAtlas {
+        &self.icon_atlas
+    }
+
     /// Render a fully-resolved batch. All text runs must have already been
     /// converted to quads (via [`resolve_text_runs`]) before calling this
     /// method — the renderer only performs GPU upload and draw dispatch.
@@ -132,6 +150,7 @@ impl Renderer {
         }
         self.sync_atlas_textures()?;
         self.upload_atlas_if_needed();
+        self.upload_icon_atlas_if_needed();
         self.draw_batch(batch)
     }
 
@@ -221,6 +240,48 @@ impl Renderer {
         self.atlas.mark_clean();
     }
 
+    fn upload_icon_atlas_if_needed(&mut self) {
+        if !self.icon_atlas.is_dirty() || !self.icon_atlas.is_loaded() {
+            return;
+        }
+        let gl = &self.gl;
+        gl.active_texture(Gl::TEXTURE1);
+        gl.bind_texture(Gl::TEXTURE_2D, Some(&self.icon_texture));
+        gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_MIN_FILTER, Gl::LINEAR as i32);
+        gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_MAG_FILTER, Gl::LINEAR as i32);
+        gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_WRAP_S, Gl::CLAMP_TO_EDGE as i32);
+        gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_WRAP_T, Gl::CLAMP_TO_EDGE as i32);
+        let data = self.icon_atlas.pixels();
+        let width = self.icon_atlas.width() as i32;
+        let height = self.icon_atlas.height() as i32;
+        gl.tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_u8_array(
+            Gl::TEXTURE_2D,
+            0,
+            Gl::RGBA as i32,
+            width,
+            height,
+            0,
+            Gl::RGBA,
+            Gl::UNSIGNED_BYTE,
+            Some(data),
+        )
+        .ok();
+        gl.active_texture(Gl::TEXTURE0);
+        self.icon_atlas.mark_clean();
+    }
+
+    fn bind_icon_texture(&self) {
+        let gl = &self.gl;
+        gl.active_texture(Gl::TEXTURE1);
+        gl.bind_texture(Gl::TEXTURE_2D, Some(&self.icon_texture));
+        if let Some(loc) = gl.get_uniform_location(&self.program, "u_material") {
+            gl.uniform1i(Some(&loc), 2);
+        }
+        if let Some(loc) = gl.get_uniform_location(&self.program, "u_icon_atlas") {
+            gl.uniform1i(Some(&loc), 1);
+        }
+    }
+
     fn draw_batch(&mut self, batch: &Batch) -> Result<(), JsValue> {
         let gl = &self.gl;
         gl.use_program(Some(&self.program));
@@ -279,6 +340,7 @@ impl Renderer {
         for cmd in &batch.commands {
             match cmd.material {
                 Material::TextAtlas => self.bind_text_texture(0),
+                Material::IconAtlas => self.bind_icon_texture(),
                 Material::Solid => self.unbind_text_texture(),
                 _ => self.unbind_text_texture(),
             }
@@ -312,18 +374,19 @@ impl Renderer {
         if let Some(tex) = self.atlas_textures.get(page_idx) {
             gl.bind_texture(Gl::TEXTURE_2D, Some(tex));
         }
-        if let Some(loc) = gl.get_uniform_location(&self.program, "u_use_texture") {
+        if let Some(loc) = gl.get_uniform_location(&self.program, "u_material") {
             gl.uniform1i(Some(&loc), 1);
         }
-        if let Some(loc) = gl.get_uniform_location(&self.program, "u_atlas") {
+        if let Some(loc) = gl.get_uniform_location(&self.program, "u_text_atlas") {
             gl.uniform1i(Some(&loc), 0);
         }
     }
 
     fn unbind_text_texture(&self) {
         let gl = &self.gl;
+        gl.active_texture(Gl::TEXTURE0);
         gl.bind_texture(Gl::TEXTURE_2D, None);
-        if let Some(loc) = gl.get_uniform_location(&self.program, "u_use_texture") {
+        if let Some(loc) = gl.get_uniform_location(&self.program, "u_material") {
             gl.uniform1i(Some(&loc), 0);
         }
     }
@@ -461,13 +524,17 @@ const FRAG_SHADER: &str = r#"#version 300 es
 precision mediump float;
 in vec2 v_uv;
 in vec4 v_color;
-uniform sampler2D u_atlas;
-uniform int u_use_texture;
+uniform sampler2D u_text_atlas;
+uniform sampler2D u_icon_atlas;
+uniform int u_material;
 out vec4 fragColor;
 void main() {
-  if (u_use_texture == 1) {
-    float a = texture(u_atlas, v_uv).r;
+  if (u_material == 1) {
+    float a = texture(u_text_atlas, v_uv).r;
     fragColor = vec4(v_color.rgb, v_color.a * a);
+  } else if (u_material == 2) {
+    vec4 tex = texture(u_icon_atlas, v_uv);
+    fragColor = tex * v_color;
   } else {
     fragColor = v_color;
   }

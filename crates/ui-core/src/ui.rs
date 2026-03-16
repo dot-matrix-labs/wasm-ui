@@ -6,6 +6,7 @@ use crate::accessibility::{A11yNode, A11yRole, A11yState, A11yTree};
 use crate::batch::{Batch, Material, Quad, TextRun};
 use crate::form::{FieldValue, Form, FormPath};
 use crate::hit_test::{HitTestEntry, HitTestGrid};
+use crate::icon::{IconId, IconPack};
 use crate::input::{InputEvent, KeyCode, PointerButton};
 use crate::text::TextBuffer;
 use crate::theme::Theme;
@@ -240,6 +241,9 @@ pub struct Ui {
     /// monospace approximation). The wasm layer replaces this with a closure
     /// that queries the glyph atlas for actual advance widths.
     char_advance: Box<dyn Fn(char, f32) -> f32>,
+    /// The loaded icon pack used by the `icon()` widget to look up UV
+    /// coordinates for named icons.
+    icon_pack: Option<IconPack>,
 }
 
 impl Ui {
@@ -267,6 +271,7 @@ impl Ui {
             id_stack: Vec::new(),
             form_buffers: HashMap::new(),
             char_advance: Box::new(|_ch, font_size| font_size * 0.6),
+            icon_pack: None,
         }
     }
 
@@ -589,6 +594,67 @@ impl Ui {
             font_size: 14.0 * self.theme.font_scale * self.scale,
             clip: None,
         });
+    }
+
+    /// Set the icon pack used by the `icon()` widget.
+    pub fn set_icon_pack(&mut self, pack: IconPack) {
+        self.icon_pack = Some(pack);
+    }
+
+    /// Draw an icon. `size` is in logical pixels (scaled by `self.scale`).
+    ///
+    /// Returns the icon's bounding rect for layout purposes, or `None` if
+    /// the icon was not found in the loaded icon pack.
+    pub fn icon(&mut self, name: &str, size: f32) -> Option<Rect> {
+        let pack = self.icon_pack.as_ref()?;
+        let icon_id = pack.get(name)?;
+        let entry = pack.entry(icon_id);
+        let scaled = size * self.scale;
+        let mut rect = self.layout.next_rect(scaled);
+        // Use a square rect matching the icon size, not the full layout width.
+        rect.w = scaled;
+
+        // Snap to pixel grid for crisp rendering.
+        rect.x = rect.x.round();
+        rect.y = rect.y.round();
+
+        self.batch.push_quad(
+            Quad {
+                rect,
+                uv: entry.uv,
+                color: self.theme.colors.text,
+                flags: 2,
+            },
+            Material::IconAtlas,
+            None,
+        );
+        Some(rect)
+    }
+
+    /// Draw an icon by `IconId`. `size` is in logical pixels.
+    ///
+    /// Returns the icon's bounding rect, or `None` if no icon pack is loaded.
+    pub fn icon_by_id(&mut self, id: IconId, size: f32) -> Option<Rect> {
+        let pack = self.icon_pack.as_ref()?;
+        let entry = pack.entry(id);
+        let scaled = size * self.scale;
+        let mut rect = self.layout.next_rect(scaled);
+        rect.w = scaled;
+
+        rect.x = rect.x.round();
+        rect.y = rect.y.round();
+
+        self.batch.push_quad(
+            Quad {
+                rect,
+                uv: entry.uv,
+                color: self.theme.colors.text,
+                flags: 2,
+            },
+            Material::IconAtlas,
+            None,
+        );
+        Some(rect)
     }
 
     pub fn button(&mut self, label: &str) -> bool {
@@ -2134,5 +2200,91 @@ mod tests {
         let ring_start = ui.batch.vertices.len() - 16;
         let ring_y = ui.batch.vertices[ring_start].pos.y;
         assert!((ring_y - (rect_b.y - 2.0)).abs() < 0.01);
+    }
+
+    // -----------------------------------------------------------------------
+    // Icon widget
+    // -----------------------------------------------------------------------
+
+    fn test_icon_pack() -> crate::icon::IconPack {
+        let json = r#"{
+            "name": "test-icons",
+            "texture_size": [256, 256],
+            "icons": [
+                { "name": "check", "x": 0, "y": 0, "w": 24, "h": 24 },
+                { "name": "close", "x": 24, "y": 0, "w": 24, "h": 24 }
+            ]
+        }"#;
+        crate::icon::IconPack::from_manifest(json).unwrap()
+    }
+
+    #[test]
+    fn icon_widget_emits_icon_atlas_quad() {
+        let mut ui = test_ui();
+        ui.begin_frame(vec![], 800.0, 600.0, 1.0, 0.0);
+        ui.set_icon_pack(test_icon_pack());
+
+        let rect = ui.icon("check", 24.0);
+        assert!(rect.is_some());
+        let rect = rect.unwrap();
+        assert!((rect.w - 24.0).abs() < f32::EPSILON);
+        assert!((rect.h - 24.0).abs() < f32::EPSILON);
+
+        // Should have emitted exactly one draw command with IconAtlas material.
+        assert_eq!(ui.batch.commands.len(), 1);
+        assert_eq!(ui.batch.commands[0].material, Material::IconAtlas);
+        // Should have 4 vertices (one quad).
+        assert_eq!(ui.batch.vertices.len(), 4);
+        // All vertices should have flags == 2 (icon material flag).
+        for v in &ui.batch.vertices {
+            assert_eq!(v.flags, 2);
+        }
+    }
+
+    #[test]
+    fn icon_widget_returns_none_for_missing_icon() {
+        let mut ui = test_ui();
+        ui.begin_frame(vec![], 800.0, 600.0, 1.0, 0.0);
+        ui.set_icon_pack(test_icon_pack());
+
+        let rect = ui.icon("nonexistent", 24.0);
+        assert!(rect.is_none());
+        // No quads should have been emitted.
+        assert!(ui.batch.vertices.is_empty());
+    }
+
+    #[test]
+    fn icon_widget_returns_none_without_pack() {
+        let mut ui = test_ui();
+        ui.begin_frame(vec![], 800.0, 600.0, 1.0, 0.0);
+
+        let rect = ui.icon("check", 24.0);
+        assert!(rect.is_none());
+    }
+
+    #[test]
+    fn icon_widget_respects_scale() {
+        let mut ui = test_ui();
+        ui.begin_frame(vec![], 800.0, 600.0, 2.0, 0.0);
+        ui.set_icon_pack(test_icon_pack());
+
+        let rect = ui.icon("check", 24.0).unwrap();
+        // At scale 2.0, the icon should be 48x48 logical pixels.
+        assert!((rect.w - 48.0).abs() < f32::EPSILON);
+        assert!((rect.h - 48.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn icon_by_id_emits_quad() {
+        let mut ui = test_ui();
+        ui.begin_frame(vec![], 800.0, 600.0, 1.0, 0.0);
+        let pack = test_icon_pack();
+        let check_id = pack.get("check").unwrap();
+        ui.set_icon_pack(pack);
+
+        let rect = ui.icon_by_id(check_id, 24.0);
+        assert!(rect.is_some());
+        assert_eq!(ui.batch.commands.len(), 1);
+        assert_eq!(ui.batch.commands[0].material, Material::IconAtlas);
     }
 }
