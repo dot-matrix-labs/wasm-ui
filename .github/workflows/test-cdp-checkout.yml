@@ -1,0 +1,62 @@
+name: "Browser: checkout form"
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: "checkout form renders correctly"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable + wasm32 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cdp-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cdp-
+
+      - name: Install wasm-pack
+        run: |
+          curl -sSL https://rustwasm.github.io/wasm-pack/installer/init.sh | sh
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build WASM (release)
+        run: cd crates/ui-wasm && wasm-pack build --target web --release --out-dir ../../examples/web/pkg
+
+      - name: Install Chromium
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends chromium-browser
+
+      - name: Test — checkout form loads
+        env:
+          CDP_HEADLESS: "1"
+          CDP_CHROME_BIN: "chromium-browser"
+          CDP_SCREENSHOT_DIR: "${{ github.workspace }}/screenshots"
+        run: |
+          mkdir -p screenshots
+          cargo test -p cdp-runner checkout_form_loads -- --nocapture
+
+      - name: Upload screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshot-checkout-${{ github.run_number }}
+          path: screenshots/
+          retention-days: 30
