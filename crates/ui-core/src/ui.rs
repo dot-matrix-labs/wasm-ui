@@ -228,6 +228,10 @@ pub struct Ui {
     _scroll_offsets: HashMap<u64, f32>,
     /// Whether the focused text input is in overwrite (insert-key toggle) mode.
     overwrite_mode: bool,
+    /// Whether the viewport is a touch/mobile device (auto-detected from
+    /// viewport width or device-pixel ratio). When true, small widgets get
+    /// expanded hit areas to meet the 44×44pt minimum touch target guideline.
+    pub touch_mode: bool,
     /// ID stack used to disambiguate widgets with identical labels.
     /// Values are pushed/popped by the caller (e.g. loop index) and mixed
     /// into every `hash_id` call so that repeated labels produce unique IDs.
@@ -245,6 +249,9 @@ pub struct Ui {
     /// coordinates for named icons.
     icon_pack: Option<IconPack>,
 }
+
+/// Minimum touch target size in logical pixels (Apple HIG: 44pt).
+const MIN_TOUCH_TARGET: f32 = 44.0;
 
 impl Ui {
     pub fn new(width: f32, height: f32, theme: Theme) -> Self {
@@ -268,6 +275,7 @@ impl Ui {
             last_click_id: None,
             _scroll_offsets: HashMap::new(),
             overwrite_mode: false,
+            touch_mode: false,
             id_stack: Vec::new(),
             form_buffers: HashMap::new(),
             char_advance: Box::new(|_ch, font_size| font_size * 0.6),
@@ -390,6 +398,7 @@ impl Ui {
         self.hovered = None;
         self.clipboard_request = None;
         self.time_ms = time_ms;
+        self.touch_mode = width < 600.0 || scale >= 2.0;
         // NOTE: selection_anchor is intentionally NOT cleared here.
         // It must persist across frames while the user is mid-drag.
         // It is cleared in apply_pointer_selection on PointerUp.
@@ -401,7 +410,7 @@ impl Ui {
         for widget in &self.widgets {
             self.hit_test.insert(HitTestEntry {
                 id: widget.id,
-                rect: widget.rect,
+                rect: self.touch_rect(widget.rect),
             });
         }
         A11yTree {
@@ -1435,11 +1444,30 @@ impl Ui {
         (last, 0)
     }
 
+    /// Expand a visual rect to meet the minimum touch target size when in
+    /// touch mode. On desktop the rect is returned unchanged. The expanded
+    /// rect is centred on the original.
+    fn touch_rect(&self, rect: Rect) -> Rect {
+        if !self.touch_mode {
+            return rect;
+        }
+        let min = MIN_TOUCH_TARGET * self.scale;
+        let w = rect.w.max(min);
+        let h = rect.h.max(min);
+        Rect::new(
+            rect.x - (w - rect.w) * 0.5,
+            rect.y - (h - rect.h) * 0.5,
+            w,
+            h,
+        )
+    }
+
     fn rect_hovered(&mut self, id: u64, rect: Rect) -> bool {
+        let hit = self.touch_rect(rect);
         let mut hovered = false;
         for event in &self.events {
             if let InputEvent::PointerMove(ev) = event {
-                if rect.contains(ev.pos) {
+                if hit.contains(ev.pos) {
                     hovered = true;
                 }
             }
@@ -1451,9 +1479,10 @@ impl Ui {
     }
 
     fn rect_pressed(&mut self, id: u64, rect: Rect) -> bool {
+        let hit = self.touch_rect(rect);
         for event in &self.events {
             if let InputEvent::PointerDown(ev) = event {
-                if rect.contains(ev.pos) && ev.button == Some(PointerButton::Left) {
+                if hit.contains(ev.pos) && ev.button == Some(PointerButton::Left) {
                     self.active = Some(id);
                     return true;
                 }
@@ -1463,9 +1492,10 @@ impl Ui {
     }
 
     fn rect_released(&mut self, id: u64, rect: Rect) -> bool {
+        let hit = self.touch_rect(rect);
         for event in &self.events {
             if let InputEvent::PointerUp(ev) = event {
-                if rect.contains(ev.pos) && ev.button == Some(PointerButton::Left) {
+                if hit.contains(ev.pos) && ev.button == Some(PointerButton::Left) {
                     if self.active == Some(id) {
                         self.active = None;
                     }
@@ -1560,7 +1590,7 @@ impl Ui {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::input::Modifiers;
+    use crate::input::{Modifiers, PointerEvent};
     use crate::theme::Theme;
 
     fn test_ui() -> Ui {
@@ -2286,5 +2316,75 @@ mod tests {
         assert!(rect.is_some());
         assert_eq!(ui.batch.commands.len(), 1);
         assert_eq!(ui.batch.commands[0].material, Material::IconAtlas);
+    }
+
+    // -----------------------------------------------------------------------
+    // Touch target sizing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn touch_rect_expands_small_widget_on_mobile() {
+        let mut ui = test_ui();
+        // Simulate mobile: width < 600
+        ui.begin_frame(vec![], 400.0, 800.0, 2.0, 0.0);
+        assert!(ui.touch_mode);
+        let small = Rect::new(100.0, 100.0, 20.0, 20.0);
+        let expanded = ui.touch_rect(small);
+        // MIN_TOUCH_TARGET * scale = 44 * 2 = 88
+        assert!(expanded.w >= 88.0 - 0.01);
+        assert!(expanded.h >= 88.0 - 0.01);
+        // Centred on original
+        let cx = small.x + small.w * 0.5;
+        let ecx = expanded.x + expanded.w * 0.5;
+        assert!((cx - ecx).abs() < 0.01);
+    }
+
+    #[test]
+    fn touch_rect_unchanged_on_desktop() {
+        let mut ui = test_ui();
+        ui.begin_frame(vec![], 1200.0, 800.0, 1.0, 0.0);
+        assert!(!ui.touch_mode);
+        let rect = Rect::new(100.0, 100.0, 20.0, 20.0);
+        let result = ui.touch_rect(rect);
+        assert_eq!(result.x, rect.x);
+        assert_eq!(result.y, rect.y);
+        assert_eq!(result.w, rect.w);
+        assert_eq!(result.h, rect.h);
+    }
+
+    #[test]
+    fn touch_mode_near_miss_registers_hit_on_mobile() {
+        let mut ui = test_ui();
+        // Place a pointer down near (but not on) a small button
+        let click_pos = Vec2::new(140.0, 60.0); // outside 20×20 rect at (100, 50) but inside expanded
+        let events = vec![
+            InputEvent::PointerDown(PointerEvent {
+                pos: click_pos,
+                button: Some(PointerButton::Left),
+                modifiers: Modifiers::default(),
+            }),
+            InputEvent::PointerUp(PointerEvent {
+                pos: click_pos,
+                button: Some(PointerButton::Left),
+                modifiers: Modifiers::default(),
+            }),
+        ];
+        ui.begin_frame(events, 400.0, 800.0, 2.0, 0.0);
+        assert!(ui.touch_mode);
+        // Manually test a small rect — the touch-expanded rect should contain the click
+        let small = Rect::new(100.0, 50.0, 20.0, 20.0);
+        let expanded = ui.touch_rect(small);
+        assert!(expanded.contains(click_pos));
+    }
+
+    #[test]
+    fn large_widget_not_expanded() {
+        let mut ui = test_ui();
+        ui.begin_frame(vec![], 400.0, 800.0, 1.0, 0.0);
+        ui.touch_mode = true;
+        let big = Rect::new(10.0, 10.0, 200.0, 60.0);
+        let result = ui.touch_rect(big);
+        assert_eq!(result.w, 200.0);
+        assert_eq!(result.h, 60.0);
     }
 }
