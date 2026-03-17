@@ -574,6 +574,8 @@ fn build_diff_image(
 
 use ui_core::{
     accessibility::{A11yRole, A11yTree},
+    batch::WidgetId,
+    form::FieldId,
     input::InputEvent,
     types::Vec2,
     ui::{WidgetInfo, WidgetKind},
@@ -581,14 +583,36 @@ use ui_core::{
 
 /// The observable output of a single rendered frame.
 ///
-/// Returned by [`Session::next_frame`]. Contains all widgets, text runs, and
-/// the accessibility tree produced by calling [`Ui::end_frame`].
+/// Returned by [`Session::next_frame`]. Contains the full draw output, focus
+/// state, and accessibility tree produced during that frame's immediate-mode
+/// pass.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use wham_test::{Session, Size};
+///
+/// let mut session = Session::new(Size { width: 480, height: 640 });
+/// let frame = session.next_frame(vec![], 0.0, |ui| {
+///     ui.label("Hello");
+///     ui.button("OK");
+/// });
+///
+/// assert!(frame.has_text("Hello"), "label must appear in text runs");
+/// assert_eq!(frame.count_kind(ui_core::ui::WidgetKind::Button), 1);
+/// ```
 pub struct FrameResult {
+    /// All widgets registered during this frame, in emission order.
     pub widgets: Vec<WidgetInfo>,
+    /// Text runs produced by the draw batcher (one per text widget).
     pub text_runs: Vec<TextRun>,
     /// Number of solid quads in the draw batch (vertex count / 4).
     pub quad_count: usize,
+    /// Accessibility tree rooted at the form node.
     pub a11y: A11yTree<A11yRole>,
+    /// The [`WidgetId`] of the currently focused widget, or `None` when no
+    /// widget holds focus.
+    pub focused_id: Option<WidgetId>,
 }
 
 impl FrameResult {
@@ -611,8 +635,32 @@ impl FrameResult {
 /// A persistent headless UI session. Keeps a [`Ui`] alive across multiple
 /// frames so interaction tests can simulate focus changes, typed text, and
 /// multi-step flows exactly as they occur in the browser.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use wham_test::{Session, Size, click_at};
+///
+/// let mut session = Session::new(Size { width: 480, height: 640 });
+///
+/// // Frame 1: render to discover widget layout.
+/// let layout = session.next_frame(vec![], 0.0, |ui| {
+///     ui.label("Sign in");
+///     ui.button("Continue");
+/// });
+///
+/// // Frame 2: click the button.
+/// let btn_center = layout.widget("Continue").unwrap().rect.center();
+/// let mut fired = false;
+/// session.next_frame(click_at(btn_center), 16.0, |ui| {
+///     ui.label("Sign in");
+///     fired = ui.button("Continue");
+/// });
+/// assert!(fired);
+/// ```
 pub struct Session {
     ui: Ui,
+    /// Canvas dimensions used for each frame.
     pub size: Size,
 }
 
@@ -631,8 +679,12 @@ impl Session {
         Self { ui, size }
     }
 
-    /// Run a single frame: inject events, call `build` to emit widgets, and
-    /// return the resulting [`FrameResult`].
+    /// Run a single frame: inject `events`, call `build` to emit widgets, then
+    /// call [`Ui::end_frame`] and return a [`FrameResult`] capturing draw
+    /// output, focus state, and the accessibility tree.
+    ///
+    /// `time_ms` is the simulated frame timestamp in milliseconds, used for
+    /// animations and debounce logic.
     pub fn next_frame(
         &mut self,
         events: Vec<InputEvent>,
@@ -647,8 +699,164 @@ impl Session {
         let widgets = self.ui.widgets().to_vec();
         let text_runs = self.ui.batch().text_runs.clone();
         let quad_count = self.ui.batch().vertices.len() / 4;
-        FrameResult { widgets, text_runs, quad_count, a11y }
+        let focused_id = self.ui.focused_id();
+        FrameResult { widgets, text_runs, quad_count, a11y, focused_id }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Assertion helpers
+// ---------------------------------------------------------------------------
+
+/// Assert that a widget with the given `widget_id` appears in the frame's
+/// widget list.
+///
+/// Panics with a clear message if no matching widget is found, including the
+/// total widget count to aid debugging.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use wham_test::{Session, Size, assert_widget_visible};
+///
+/// let mut session = Session::new(Size { width: 480, height: 640 });
+/// let frame = session.next_frame(vec![], 0.0, |ui| {
+///     ui.button("OK");
+/// });
+/// let id = frame.widget("OK").unwrap().id;
+/// assert_widget_visible(&frame, id);
+/// ```
+pub fn assert_widget_visible(frame: &FrameResult, widget_id: WidgetId) {
+    let found = frame.widgets.iter().any(|w| w.id == widget_id);
+    assert!(
+        found,
+        "wham-test: expected widget with id {widget_id} to be visible, \
+         but it was not found among {} widgets in this frame",
+        frame.widgets.len(),
+    );
+}
+
+/// Assert that the widget with `widget_id` currently holds keyboard focus.
+///
+/// Panics with a clear message if focus belongs to a different widget or to no
+/// widget at all.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use wham_test::{Session, Size, click_at, assert_focused};
+///
+/// let mut session = Session::new(Size { width: 480, height: 640 });
+/// let layout = session.next_frame(vec![], 0.0, |ui| {
+///     ui.button("OK");
+/// });
+/// let id = layout.widget("OK").unwrap().id;
+/// let pos = layout.widget("OK").unwrap().rect.center();
+/// let frame2 = session.next_frame(click_at(pos), 16.0, |ui| {
+///     ui.button("OK");
+/// });
+/// assert_focused(&frame2, id);
+/// ```
+pub fn assert_focused(frame: &FrameResult, widget_id: WidgetId) {
+    match frame.focused_id {
+        Some(id) if id == widget_id => {}
+        Some(other) => panic!(
+            "wham-test: expected widget {widget_id} to be focused, \
+             but widget {other} holds focus instead",
+        ),
+        None => panic!(
+            "wham-test: expected widget {widget_id} to be focused, \
+             but no widget currently holds focus",
+        ),
+    }
+}
+
+/// Assert that the widget whose **label** matches `field_id` has the given
+/// string `expected` as its current value.
+///
+/// Widget value is the string stored in [`WidgetInfo::value`].  For text
+/// inputs this is the current buffer content; for checkboxes it is `"true"` or
+/// `"false"`; for selects it is the selected option.
+///
+/// Panics with a clear message if the widget is not found or its value does
+/// not match.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use ui_core::form::{FieldValue, Form, FormPath, FormSchema, FieldType};
+/// use wham_test::{Session, Size, assert_field_value};
+///
+/// let schema = FormSchema::new("login").field("email", FieldType::Text);
+/// let mut form = Form::new(schema);
+/// form.set_value(&FormPath::root().push("email"), FieldValue::Text("a@b.com".into()));
+///
+/// let mut session = Session::new(Size { width: 480, height: 320 });
+/// let frame = session.next_frame(vec![], 0.0, |ui| {
+///     ui.text_input_for(&mut form, &FormPath::root().push("email"), "Email", "");
+/// });
+/// assert_field_value(&frame, "Email".to_string(), "a@b.com");
+/// ```
+pub fn assert_field_value(frame: &FrameResult, field_id: FieldId, expected: &str) {
+    let widget = frame
+        .widgets
+        .iter()
+        .find(|w| w.label == field_id)
+        .unwrap_or_else(|| {
+            panic!(
+                "wham-test: field '{}' not found in frame (available labels: [{}])",
+                field_id,
+                frame
+                    .widgets
+                    .iter()
+                    .map(|w| w.label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )
+        });
+    let actual = widget.value.as_deref().unwrap_or("");
+    assert_eq!(
+        actual, expected,
+        "wham-test: field '{}' has value {:?}, expected {:?}",
+        field_id, actual, expected,
+    );
+}
+
+/// Assert that the accessibility node for `widget_id` has the accessible name
+/// `label`.
+///
+/// The function searches the flattened [`A11yTree`] for a node whose `id`
+/// matches `widget_id` and checks that its `name` equals `label`.
+///
+/// Panics with a clear message if the node is missing or the name does not
+/// match.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use wham_test::{Session, Size, assert_accessible_label};
+///
+/// let mut session = Session::new(Size { width: 480, height: 640 });
+/// let frame = session.next_frame(vec![], 0.0, |ui| {
+///     ui.button("Submit");
+/// });
+/// let id = frame.widget("Submit").unwrap().id;
+/// assert_accessible_label(&frame, id, "Submit");
+/// ```
+pub fn assert_accessible_label(frame: &FrameResult, widget_id: WidgetId, label: &str) {
+    let nodes = frame.a11y.flatten();
+    let node = nodes.iter().find(|n| n.id == widget_id).unwrap_or_else(|| {
+        panic!(
+            "wham-test: accessibility node for widget {widget_id} not found \
+             in a11y tree ({} nodes total)",
+            nodes.len(),
+        )
+    });
+    assert_eq!(
+        node.name, label,
+        "wham-test: accessibility node {widget_id} has name {:?}, expected {:?}",
+        node.name, label,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -864,5 +1072,165 @@ mod tests {
         .assert_matches();
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // -----------------------------------------------------------------------
+    // Session and FrameResult
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn session_next_frame_captures_widgets() {
+        let mut session = Session::new(Size { width: 320, height: 240 });
+        let frame = session.next_frame(vec![], 0.0, |ui| {
+            ui.label("Hello");
+            ui.button("Go");
+        });
+        assert_eq!(frame.count_kind(WidgetKind::Label), 1);
+        assert_eq!(frame.count_kind(WidgetKind::Button), 1);
+    }
+
+    #[test]
+    fn session_next_frame_captures_text_runs() {
+        let mut session = Session::new(Size { width: 320, height: 240 });
+        let frame = session.next_frame(vec![], 0.0, |ui| {
+            ui.label("Greetings");
+        });
+        assert!(frame.has_text("Greetings"), "label text must appear in text runs");
+    }
+
+    #[test]
+    fn session_next_frame_focused_id_is_none_initially() {
+        let mut session = Session::new(Size { width: 320, height: 240 });
+        let frame = session.next_frame(vec![], 0.0, |ui| {
+            ui.button("OK");
+        });
+        // No interaction yet — no widget should hold focus.
+        assert!(
+            frame.focused_id.is_none(),
+            "focused_id should be None before any interaction"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // assert_widget_visible
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn assert_widget_visible_passes_for_present_widget() {
+        let mut session = Session::new(Size { width: 320, height: 240 });
+        let frame = session.next_frame(vec![], 0.0, |ui| {
+            ui.button("Visible");
+        });
+        let id = frame.widget("Visible").expect("button not found").id;
+        assert_widget_visible(&frame, id); // must not panic
+    }
+
+    #[test]
+    #[should_panic(expected = "expected widget with id")]
+    fn assert_widget_visible_panics_for_absent_widget() {
+        let mut session = Session::new(Size { width: 320, height: 240 });
+        let frame = session.next_frame(vec![], 0.0, |ui| {
+            ui.button("Only");
+        });
+        assert_widget_visible(&frame, u64::MAX); // no widget has this id
+    }
+
+    // -----------------------------------------------------------------------
+    // assert_focused
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn assert_focused_passes_when_widget_is_focused() {
+        use ui_core::input::{Modifiers, PointerButton, PointerEvent};
+
+        let mut session = Session::new(Size { width: 480, height: 320 });
+
+        // Frame 1: discover button position.
+        let layout = session.next_frame(vec![], 0.0, |ui| {
+            ui.button("Click me");
+        });
+        let btn_id = layout.widget("Click me").expect("button not found").id;
+        let btn_center = layout.widget("Click me").unwrap().rect.center();
+
+        // Frame 2: click to focus the button.
+        let ev = PointerEvent {
+            pos: btn_center,
+            button: Some(PointerButton::Left),
+            modifiers: Modifiers::default(),
+        };
+        let events = vec![InputEvent::PointerDown(ev), InputEvent::PointerUp(ev)];
+        let frame2 = session.next_frame(events, 16.0, |ui| {
+            ui.button("Click me");
+        });
+
+        assert_focused(&frame2, btn_id); // must not panic
+    }
+
+    #[test]
+    #[should_panic(expected = "no widget currently holds focus")]
+    fn assert_focused_panics_when_nothing_focused() {
+        let mut session = Session::new(Size { width: 320, height: 240 });
+        let frame = session.next_frame(vec![], 0.0, |ui| {
+            ui.button("Idle");
+        });
+        let id = frame.widget("Idle").unwrap().id;
+        assert_focused(&frame, id); // no click yet — should panic
+    }
+
+    // -----------------------------------------------------------------------
+    // assert_field_value
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn assert_field_value_passes_when_value_matches() {
+        use ui_core::form::{FieldType, FieldValue, Form, FormPath, FormSchema};
+
+        let schema = FormSchema::new("test").field("name", FieldType::Text);
+        let mut form = Form::new(schema);
+        form.set_value(
+            &FormPath::root().push("name"),
+            FieldValue::Text("Alice".into()),
+        );
+
+        let mut session = Session::new(Size { width: 480, height: 320 });
+        let frame = session.next_frame(vec![], 0.0, |ui| {
+            ui.text_input_for(&mut form, &FormPath::root().push("name"), "Name", "");
+        });
+
+        assert_field_value(&frame, "Name".to_string(), "Alice"); // must not panic
+    }
+
+    #[test]
+    #[should_panic(expected = "field 'Missing'")]
+    fn assert_field_value_panics_when_field_absent() {
+        let mut session = Session::new(Size { width: 320, height: 240 });
+        let frame = session.next_frame(vec![], 0.0, |ui| {
+            ui.label("Other");
+        });
+        assert_field_value(&frame, "Missing".to_string(), "anything");
+    }
+
+    // -----------------------------------------------------------------------
+    // assert_accessible_label
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn assert_accessible_label_passes_for_correct_name() {
+        let mut session = Session::new(Size { width: 320, height: 240 });
+        let frame = session.next_frame(vec![], 0.0, |ui| {
+            ui.button("Submit");
+        });
+        let id = frame.widget("Submit").expect("button not found").id;
+        assert_accessible_label(&frame, id, "Submit"); // must not panic
+    }
+
+    #[test]
+    #[should_panic(expected = "accessibility node for widget")]
+    fn assert_accessible_label_panics_when_node_absent() {
+        let mut session = Session::new(Size { width: 320, height: 240 });
+        let frame = session.next_frame(vec![], 0.0, |ui| {
+            ui.button("Real");
+        });
+        assert_accessible_label(&frame, u64::MAX, "anything");
     }
 }
